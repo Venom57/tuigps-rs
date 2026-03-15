@@ -6,8 +6,8 @@ use crate::ui::*;
 pub fn render_dashboard(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical([
         Constraint::Ratio(3, 10),
-        Constraint::Ratio(4, 10),
-        Constraint::Ratio(3, 10),
+        Constraint::Ratio(5, 10),
+        Constraint::Ratio(2, 10),
     ])
     .split(area);
 

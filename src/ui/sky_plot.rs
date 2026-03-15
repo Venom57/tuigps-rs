@@ -23,9 +23,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let cx = w / 2;
     let cy = h / 2;
     // Separate X/Y radii for aspect ratio (terminal chars are ~2:1)
-    // Leave room for cardinal labels outside the rings
-    let max_rx = cx.saturating_sub(3).max(2);
-    let max_ry = cy.saturating_sub(1).max(1);
+    // Reserve space for cardinal labels if there's enough room
+    let label_margin_x: usize = if w > 20 { 3 } else { 1 };
+    let label_margin_y: usize = if h > 10 { 1 } else { 0 };
+    let max_rx = cx.saturating_sub(label_margin_x).max(2);
+    let max_ry = cy.saturating_sub(label_margin_y).max(2);
 
     // Draw concentric elevation rings at 0°, 30°, 60°
     for elev_deg in [0, 30, 60] {
