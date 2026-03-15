@@ -73,8 +73,8 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_satellites(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Length(10), // constellation summary
-        Constraint::Min(0),    // satellite table
+        Constraint::Length(1), // constellation summary (compact bar)
+        Constraint::Min(0),   // satellite table
     ])
     .split(area);
 
