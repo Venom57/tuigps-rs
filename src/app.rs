@@ -377,6 +377,21 @@ impl App {
                     }
                 }
 
+                // Armed clock sync — fires on fresh TPV for minimum latency
+                if self.armed_clock_set
+                    && !self.gps_data.time.is_empty()
+                    && self.gps_data.last_seen > 0.0
+                {
+                    self.armed_clock_set = false;
+                    match clock_sync::set_clock_from_gps(
+                        &self.gps_data.time,
+                        self.gps_data.last_seen,
+                    ) {
+                        Ok(msg) => self.set_status(&msg),
+                        Err(e) => self.set_status(format!("Clock sync error: {}", e)),
+                    }
+                }
+
                 // Log if active
                 if let Some(ref mut logger) = self.logger {
                     let _ = logger.log_point(&self.gps_data);
@@ -636,20 +651,13 @@ impl App {
                     }
                 }
                 KeyCode::Char('k') => {
-                    if self.gps_data.time.is_empty() || self.gps_data.last_seen <= 0.0 {
-                        self.set_status("No GPS time available for clock sync");
+                    // Toggle armed clock sync
+                    if self.armed_clock_set {
+                        self.armed_clock_set = false;
+                        self.set_status("Clock sync disarmed");
                     } else {
-                        match clock_sync::set_clock_from_gps(
-                            &self.gps_data.time,
-                            self.gps_data.last_seen,
-                        ) {
-                            Ok(msg) => {
-                                self.set_status(&msg);
-                            }
-                            Err(e) => {
-                                self.set_status(format!("Clock sync error: {}", e));
-                            }
-                        }
+                        self.armed_clock_set = true;
+                        self.set_status("Clock sync ARMED — will fire on next GPS fix");
                     }
                 }
                 _ => {}

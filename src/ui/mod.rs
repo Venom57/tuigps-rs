@@ -113,7 +113,11 @@ fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" c ", Style::default().fg(Color::White).bg(Color::DarkGray)),
         Span::raw(" clear TOFF  "),
         Span::styled(" k ", Style::default().fg(Color::White).bg(Color::DarkGray)),
-        Span::raw(" clock sync  "),
+        if app.armed_clock_set {
+            Span::styled(" ARMED ", Style::default().fg(Color::Black).bg(Color::Red))
+        } else {
+            Span::raw(" clock sync  ")
+        },
     ];
 
     // Show status message if present
