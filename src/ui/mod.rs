@@ -95,19 +95,35 @@ fn render_timing(f: &mut Frame, area: Rect, app: &App) {
     device_panel::render(f, chunks[2], app);
 }
 
-fn render_toff_controls(f: &mut Frame, area: Rect, _app: &App) {
+fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered();
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines = vec![Line::from(vec![
+    use std::sync::atomic::Ordering;
+    let is_armed = app.armed_toff.load(Ordering::Relaxed);
+
+    let mut spans = vec![
         Span::styled(" a ", Style::default().fg(Color::White).bg(Color::DarkGray)),
-        Span::raw(" arm TOFF  "),
+        if is_armed {
+            Span::styled(" ARMED ", Style::default().fg(Color::Black).bg(Color::Yellow))
+        } else {
+            Span::raw(" arm TOFF  ")
+        },
         Span::styled(" c ", Style::default().fg(Color::White).bg(Color::DarkGray)),
         Span::raw(" clear TOFF  "),
         Span::styled(" k ", Style::default().fg(Color::White).bg(Color::DarkGray)),
         Span::raw(" clock sync  "),
-    ])];
+    ];
 
-    f.render_widget(Paragraph::new(lines), inner);
+    // Show status message if present
+    if !app.status_message.is_empty() {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            app.status_message.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
 }

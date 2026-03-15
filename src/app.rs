@@ -228,6 +228,10 @@ pub struct App {
 
     // Reconnect signal
     pub reconnect_requested: bool,
+
+    // Status message (shown on current tab, auto-clears)
+    pub status_message: String,
+    pub status_message_tick: u32,
 }
 
 impl App {
@@ -259,7 +263,14 @@ impl App {
             stale: false,
             stale_seconds: 0.0,
             reconnect_requested: false,
+            status_message: String::new(),
+            status_message_tick: 0,
         }
+    }
+
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = msg.into();
+        self.status_message_tick = 5; // show for 5 ticks (seconds)
     }
 
     pub fn handle_event(&mut self, event: Event) {
@@ -334,6 +345,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        // Staleness detection
         if self.gps_data.last_seen > 0.0 {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -343,6 +355,14 @@ impl App {
             if age > 10.0 {
                 self.stale = true;
                 self.stale_seconds = age;
+            }
+        }
+
+        // Auto-clear status message
+        if self.status_message_tick > 0 {
+            self.status_message_tick -= 1;
+            if self.status_message_tick == 0 {
+                self.status_message.clear();
             }
         }
     }
@@ -522,27 +542,35 @@ impl App {
             ActiveTab::Timing => match key.code {
                 KeyCode::Char('a') => {
                     self.armed_toff.store(true, Ordering::SeqCst);
+                    self.set_status("TOFF armed — waiting for next fix...");
                 }
                 KeyCode::Char('c') => {
+                    let had_data = !self.gps_data.toff_samples.is_empty()
+                        || self.gps_data.toff_armed_offset.is_finite();
                     self.gps_data.toff_samples.clear();
                     self.gps_data.toff_armed_offset = f64::NAN;
                     self.gps_data.toff_armed_gps_time.clear();
                     self.gps_data.toff_armed_sys_time = f64::NAN;
+                    self.armed_toff.store(false, Ordering::SeqCst);
+                    if had_data {
+                        self.set_status("TOFF data cleared");
+                    } else {
+                        self.set_status("TOFF data already empty");
+                    }
                 }
                 KeyCode::Char('k') => {
-                    // Clock sync from GPS time
-                    if !self.gps_data.time.is_empty() && self.gps_data.last_seen > 0.0 {
+                    if self.gps_data.time.is_empty() || self.gps_data.last_seen <= 0.0 {
+                        self.set_status("No GPS time available for clock sync");
+                    } else {
                         match clock_sync::set_clock_from_gps(
                             &self.gps_data.time,
                             self.gps_data.last_seen,
                         ) {
                             Ok(msg) => {
-                                self.device_config.output_log.push(msg);
+                                self.set_status(&msg);
                             }
                             Err(e) => {
-                                self.device_config
-                                    .output_log
-                                    .push(format!("Clock sync error: {}", e));
+                                self.set_status(format!("Clock sync error: {}", e));
                             }
                         }
                     }
@@ -988,6 +1016,47 @@ mod tests {
         app.handle_event(key_event(KeyCode::Char('c')));
         assert!(app.gps_data.toff_samples.is_empty());
         assert!(app.gps_data.toff_armed_offset.is_nan());
+        assert!(app.status_message.contains("cleared"));
+    }
+
+    #[test]
+    fn test_timing_clear_empty() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+
+        app.handle_event(key_event(KeyCode::Char('c')));
+        assert!(app.status_message.contains("empty"));
+    }
+
+    #[test]
+    fn test_timing_arm_shows_status() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+
+        app.handle_event(key_event(KeyCode::Char('a')));
+        assert!(app.armed_toff.load(Ordering::SeqCst));
+        assert!(app.status_message.contains("armed"));
+    }
+
+    #[test]
+    fn test_timing_clock_sync_no_gps() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+
+        app.handle_event(key_event(KeyCode::Char('k')));
+        assert!(app.status_message.contains("No GPS time"));
+    }
+
+    #[test]
+    fn test_status_message_auto_clears() {
+        let mut app = new_app();
+        app.set_status("test message");
+        assert!(!app.status_message.is_empty());
+
+        for _ in 0..5 {
+            app.tick();
+        }
+        assert!(app.status_message.is_empty());
     }
 
     // === Satellites tab ===
