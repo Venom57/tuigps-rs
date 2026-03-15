@@ -4,22 +4,30 @@ use ratatui::widgets::*;
 use crate::app::App;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(format!(
-        " NMEA {} {} ",
-        if app.nmea_paused { "[PAUSED]" } else { "" },
-        if app.nmea_filter.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", app.nmea_filter)
-        },
-    ));
+    let filter_label = if app.nmea_filter.is_empty() {
+        "ALL".to_string()
+    } else {
+        app.nmea_filter.clone()
+    };
+
+    let title = format!(
+        " NMEA [{}]{} ",
+        filter_label,
+        if app.nmea_paused { " [PAUSED]" } else { "" },
+    );
+    let block = Block::bordered().title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines: Vec<Line> = app
+    let height = inner.height as usize;
+    if height == 0 {
+        return;
+    }
+
+    // Filter sentences
+    let filtered: Vec<&String> = app
         .nmea_buffer
         .iter()
-        .rev()
         .filter(|s| {
             if app.nmea_filter.is_empty() {
                 true
@@ -27,17 +35,38 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 nmea_type(s) == app.nmea_filter
             }
         })
-        .take(inner.height as usize)
+        .collect();
+
+    // Apply scroll offset (offset is from the bottom)
+    let total = filtered.len();
+    let scroll = app.nmea_scroll_offset.min(total.saturating_sub(height));
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+
+    let lines: Vec<Line> = filtered[start..end]
+        .iter()
         .map(|s| {
             let color = nmea_color(nmea_type(s));
-            Line::styled(s.clone(), Style::default().fg(color))
+            Line::styled((*s).clone(), Style::default().fg(color))
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect();
 
     f.render_widget(Paragraph::new(lines), inner);
+
+    // Show scroll indicator if not at bottom
+    if scroll > 0 {
+        let indicator = format!(" +{} ", scroll);
+        let indicator_area = Rect::new(
+            inner.x + inner.width.saturating_sub(indicator.len() as u16 + 1),
+            area.y,
+            indicator.len() as u16,
+            1,
+        );
+        f.render_widget(
+            Paragraph::new(indicator).style(Style::default().fg(Color::Yellow)),
+            indicator_area,
+        );
+    }
 }
 
 fn nmea_type(sentence: &str) -> &str {

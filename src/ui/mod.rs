@@ -21,9 +21,9 @@ pub mod velocity;
 
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Length(1),   // tab bar
-        Constraint::Min(0),     // main content
-        Constraint::Length(1),  // status bar
+        Constraint::Length(1),  // tab bar
+        Constraint::Min(0),    // main content
+        Constraint::Length(1), // status bar
     ])
     .split(f.area());
 
@@ -84,11 +84,30 @@ fn render_satellites(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_timing(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Ratio(1, 2),
-        Constraint::Ratio(1, 2),
+        Constraint::Min(0),
+        Constraint::Length(3), // TOFF controls
+        Constraint::Length(8), // device panel
     ])
     .split(area);
 
     time_panel::render(f, chunks[0], app, true);
-    device_panel::render(f, chunks[1], app);
+    render_toff_controls(f, chunks[1], app);
+    device_panel::render(f, chunks[2], app);
+}
+
+fn render_toff_controls(f: &mut Frame, area: Rect, _app: &App) {
+    let block = Block::bordered();
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = vec![Line::from(vec![
+        Span::styled(" a ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+        Span::raw(" arm TOFF  "),
+        Span::styled(" c ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+        Span::raw(" clear TOFF  "),
+        Span::styled(" k ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+        Span::raw(" clock sync  "),
+    ])];
+
+    f.render_widget(Paragraph::new(lines), inner);
 }

@@ -33,8 +33,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("Geoid:   {}", fmt(data.geoid_sep, 1, " m"))),
     ];
 
-    if let Some(hold) = &app.position_hold {
-        if let Some(result) = hold.result() {
+    if let Some(hold) = &app.position_hold
+        && let Some(result) = hold.result() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::raw("CEP50: "),
@@ -51,7 +51,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 ),
             ]));
         }
-    }
 
     f.render_widget(Paragraph::new(lines), inner);
 }

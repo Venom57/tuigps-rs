@@ -132,3 +132,87 @@ pub fn bearing_to_compass(degrees: f64) -> &'static str {
     let idx = ((degrees + 11.25) % 360.0 / 22.5) as usize;
     COMPASS_POINTS[idx.min(15)]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gnss_name_known() {
+        assert_eq!(gnss_name(0), "GPS");
+        assert_eq!(gnss_name(2), "Galileo");
+        assert_eq!(gnss_name(6), "GLONASS");
+    }
+
+    #[test]
+    fn test_gnss_name_unknown() {
+        assert_eq!(gnss_name(99), "Unknown");
+    }
+
+    #[test]
+    fn test_gnss_short() {
+        assert_eq!(gnss_short(0), "GP");
+        assert_eq!(gnss_short(3), "BD");
+    }
+
+    #[test]
+    fn test_mode_name() {
+        assert_eq!(mode_name(FixMode::Fix3D), "3D Fix");
+        assert_eq!(mode_name(FixMode::NoFix), "No Fix");
+    }
+
+    #[test]
+    fn test_dop_rating_ideal() {
+        let (rating, _) = dop_rating(0.5);
+        assert_eq!(rating, "Ideal");
+    }
+
+    #[test]
+    fn test_dop_rating_excellent() {
+        let (rating, _) = dop_rating(1.5);
+        assert_eq!(rating, "Excellent");
+    }
+
+    #[test]
+    fn test_dop_rating_poor() {
+        let (rating, _) = dop_rating(25.0);
+        assert_eq!(rating, "Poor");
+    }
+
+    #[test]
+    fn test_dop_rating_nan() {
+        let (rating, _) = dop_rating(f64::NAN);
+        assert_eq!(rating, "---");
+    }
+
+    #[test]
+    fn test_bearing_north() {
+        assert_eq!(bearing_to_compass(0.0), "N");
+        assert_eq!(bearing_to_compass(5.0), "N");
+    }
+
+    #[test]
+    fn test_bearing_east() {
+        assert_eq!(bearing_to_compass(90.0), "E");
+    }
+
+    #[test]
+    fn test_bearing_south() {
+        assert_eq!(bearing_to_compass(180.0), "S");
+    }
+
+    #[test]
+    fn test_bearing_west() {
+        assert_eq!(bearing_to_compass(270.0), "W");
+    }
+
+    #[test]
+    fn test_bearing_nan() {
+        assert_eq!(bearing_to_compass(f64::NAN), "---");
+    }
+
+    #[test]
+    fn test_bearing_360() {
+        assert_eq!(bearing_to_compass(359.0), "N");
+    }
+}

@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -9,7 +11,7 @@ use crate::data_model::*;
 
 #[derive(Debug, Clone)]
 pub enum GpsdEvent {
-    Update(GPSData),
+    Update(Box<GPSData>),
     Error(String),
     Nmea(String),
 }
@@ -19,9 +21,10 @@ pub async fn gpsd_task(
     port: u16,
     tx: mpsc::Sender<GpsdEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    armed_toff: Arc<AtomicBool>,
 ) {
     loop {
-        match connect_and_read(&host, port, &tx, &mut shutdown).await {
+        match connect_and_read(&host, port, &tx, &mut shutdown, &armed_toff).await {
             Ok(()) => break, // clean shutdown
             Err(e) => {
                 let _ = tx.send(GpsdEvent::Error(e.to_string())).await;
@@ -39,6 +42,7 @@ async fn connect_and_read(
     port: u16,
     tx: &mpsc::Sender<GpsdEvent>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    armed_toff: &Arc<AtomicBool>,
 ) -> Result<()> {
     let stream = TcpStream::connect((host, port)).await?;
     let (reader, mut writer) = stream.into_split();
@@ -51,8 +55,7 @@ async fn connect_and_read(
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let mut data = GPSData::default();
-    data.connected = true;
+    let mut data = GPSData { connected: true, ..Default::default() };
 
     loop {
         line.clear();
@@ -72,8 +75,8 @@ async fn connect_and_read(
                 if trimmed.starts_with('$') || trimmed.starts_with('!') {
                     let _ = tx.send(GpsdEvent::Nmea(trimmed.to_string())).await;
                 } else {
-                    process_message(trimmed, &mut data, receipt_time);
-                    let _ = tx.send(GpsdEvent::Update(data.clone())).await;
+                    process_message(trimmed, &mut data, receipt_time, armed_toff);
+                    let _ = tx.send(GpsdEvent::Update(Box::new(data.clone()))).await;
                 }
             }
             _ = shutdown.changed() => return Ok(()),
@@ -81,7 +84,12 @@ async fn connect_and_read(
     }
 }
 
-fn process_message(line: &str, data: &mut GPSData, receipt_time: f64) {
+fn process_message(
+    line: &str,
+    data: &mut GPSData,
+    receipt_time: f64,
+    armed_toff: &Arc<AtomicBool>,
+) {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
@@ -89,7 +97,7 @@ fn process_message(line: &str, data: &mut GPSData, receipt_time: f64) {
     let class = msg["class"].as_str().unwrap_or("");
 
     match class {
-        "TPV" => extract_tpv(&msg, data, receipt_time),
+        "TPV" => extract_tpv(&msg, data, receipt_time, armed_toff),
         "SKY" => extract_sky(&msg, data),
         "PPS" => extract_pps(&msg, data),
         "TOFF" => extract_toff(&msg, data),
@@ -106,7 +114,12 @@ fn json_f64(msg: &Value, key: &str) -> f64 {
     msg[key].as_f64().unwrap_or(f64::NAN)
 }
 
-fn extract_tpv(msg: &Value, data: &mut GPSData, receipt_time: f64) {
+fn extract_tpv(
+    msg: &Value,
+    data: &mut GPSData,
+    receipt_time: f64,
+    armed_toff: &Arc<AtomicBool>,
+) {
     data.mode = FixMode::from(msg["mode"].as_u64().unwrap_or(0) as u8);
     data.status = FixStatus::from(msg["status"].as_u64().unwrap_or(0) as u8);
 
@@ -155,6 +168,16 @@ fn extract_tpv(msg: &Value, data: &mut GPSData, receipt_time: f64) {
                 data.toff_samples.remove(0);
             }
             data.toff_samples.push(offset);
+
+            // Check for armed single-shot TOFF capture
+            if armed_toff
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                data.toff_armed_offset = offset;
+                data.toff_armed_gps_time = time_str.to_string();
+                data.toff_armed_sys_time = receipt_time;
+            }
         }
     }
 }
@@ -168,8 +191,8 @@ fn extract_sky(msg: &Value, data: &mut GPSData) {
     data.dop.xdop = json_f64(msg, "xdop");
     data.dop.ydop = json_f64(msg, "ydop");
 
-    if let Some(sats) = msg["satellites"].as_array() {
-        if !sats.is_empty() {
+    if let Some(sats) = msg["satellites"].as_array()
+        && !sats.is_empty() {
             data.satellites = sats
                 .iter()
                 .map(|s| SatelliteInfo {
@@ -187,7 +210,6 @@ fn extract_sky(msg: &Value, data: &mut GPSData) {
                 .collect();
             data.satellites_used = data.satellites.iter().filter(|s| s.used).count() as u32;
         }
-    }
 }
 
 fn extract_pps(msg: &Value, data: &mut GPSData) {
@@ -207,11 +229,10 @@ fn extract_toff(msg: &Value, data: &mut GPSData) {
 }
 
 fn extract_devices(msg: &Value, data: &mut GPSData) {
-    if let Some(devices) = msg["devices"].as_array() {
-        if let Some(dev) = devices.first() {
+    if let Some(devices) = msg["devices"].as_array()
+        && let Some(dev) = devices.first() {
             extract_device_fields(dev, data);
         }
-    }
 }
 
 fn extract_device(msg: &Value, data: &mut GPSData) {
@@ -243,4 +264,214 @@ fn extract_version(msg: &Value, data: &mut GPSData) {
     }
     data.version.proto_major = msg["proto_major"].as_u64().unwrap_or(0) as u32;
     data.version.proto_minor = msg["proto_minor"].as_u64().unwrap_or(0) as u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn make_armed() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn test_json_f64_present() {
+        let v: Value = serde_json::from_str(r#"{"lat": 51.5074}"#).unwrap();
+        assert!((json_f64(&v, "lat") - 51.5074).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_json_f64_missing() {
+        let v: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(json_f64(&v, "lat").is_nan());
+    }
+
+    #[test]
+    fn test_extract_tpv() {
+        let armed = make_armed();
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "TPV",
+                "mode": 3,
+                "status": 1,
+                "lat": 51.5074,
+                "lon": -0.1278,
+                "altHAE": 100.5,
+                "altMSL": 55.2,
+                "speed": 1.5,
+                "track": 180.0,
+                "climb": 0.1,
+                "time": "2024-01-15T12:30:00.000Z",
+                "eph": 5.0,
+                "epv": 10.0
+            }"#,
+        )
+        .unwrap();
+
+        extract_tpv(&msg, &mut data, 1705318200.0, &armed);
+
+        assert_eq!(data.mode, FixMode::Fix3D);
+        assert_eq!(data.status, FixStatus::Gps);
+        assert!((data.latitude - 51.5074).abs() < 1e-10);
+        assert!((data.longitude - (-0.1278)).abs() < 1e-10);
+        assert!((data.alt_hae - 100.5).abs() < 1e-10);
+        assert!((data.speed - 1.5).abs() < 1e-10);
+        assert_eq!(data.time, "2024-01-15T12:30:00.000Z");
+        assert!((data.errors.eph - 5.0).abs() < 1e-10);
+        assert_eq!(data.toff_samples.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_tpv_armed_toff() {
+        let armed = Arc::new(AtomicBool::new(true));
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "TPV",
+                "mode": 3,
+                "time": "2024-01-15T12:30:00.000Z"
+            }"#,
+        )
+        .unwrap();
+
+        extract_tpv(&msg, &mut data, 1705318200.0, &armed);
+
+        assert!(!armed.load(Ordering::Relaxed)); // should be disarmed
+        assert!(data.toff_armed_offset.is_finite());
+        assert_eq!(data.toff_armed_gps_time, "2024-01-15T12:30:00.000Z");
+    }
+
+    #[test]
+    fn test_extract_sky() {
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "SKY",
+                "hdop": 0.8,
+                "vdop": 1.2,
+                "pdop": 1.5,
+                "gdop": 2.0,
+                "tdop": 0.9,
+                "satellites": [
+                    {"PRN": 1, "gnssid": 0, "svid": 1, "el": 45.0, "az": 180.0, "ss": 35.0, "used": true, "sigid": 0, "health": 1},
+                    {"PRN": 5, "gnssid": 0, "svid": 5, "el": 20.0, "az": 90.0, "ss": 25.0, "used": false, "sigid": 0, "health": 1}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        extract_sky(&msg, &mut data);
+
+        assert!((data.dop.hdop - 0.8).abs() < 1e-10);
+        assert!((data.dop.vdop - 1.2).abs() < 1e-10);
+        assert_eq!(data.satellites.len(), 2);
+        assert_eq!(data.satellites_used, 1);
+        assert_eq!(data.satellites[0].prn, 1);
+        assert!(data.satellites[0].used);
+        assert!(!data.satellites[1].used);
+    }
+
+    #[test]
+    fn test_extract_pps() {
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "PPS",
+                "real_sec": 1705318200,
+                "real_nsec": 500,
+                "clock_sec": 1705318200,
+                "clock_nsec": 1000,
+                "precision": -20,
+                "qErr": 50
+            }"#,
+        )
+        .unwrap();
+
+        extract_pps(&msg, &mut data);
+
+        assert_eq!(data.pps.real_sec, 1705318200);
+        assert_eq!(data.pps.real_nsec, 500);
+        assert_eq!(data.pps.precision, -20);
+        assert_eq!(data.pps.qerr, 50);
+    }
+
+    #[test]
+    fn test_extract_version() {
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "VERSION",
+                "release": "3.25",
+                "proto_major": 3,
+                "proto_minor": 15
+            }"#,
+        )
+        .unwrap();
+
+        extract_version(&msg, &mut data);
+
+        assert_eq!(data.version.release, "3.25");
+        assert_eq!(data.version.proto_major, 3);
+        assert_eq!(data.version.proto_minor, 15);
+    }
+
+    #[test]
+    fn test_extract_device() {
+        let mut data = GPSData::default();
+        let msg: Value = serde_json::from_str(
+            r#"{
+                "class": "DEVICE",
+                "path": "/dev/ttyACM0",
+                "driver": "u-blox",
+                "subtype": "SW 1.00,HW 00080000",
+                "bps": 9600,
+                "cycle": 1.0
+            }"#,
+        )
+        .unwrap();
+
+        extract_device(&msg, &mut data);
+
+        assert_eq!(data.device.path, "/dev/ttyACM0");
+        assert_eq!(data.device.driver, "u-blox");
+        assert_eq!(data.device.bps, 9600);
+    }
+
+    #[test]
+    fn test_process_message_invalid_json() {
+        let armed = make_armed();
+        let mut data = GPSData::default();
+        process_message("not valid json", &mut data, 0.0, &armed);
+        // Should not crash, data unchanged
+        assert_eq!(data.mode, FixMode::Unknown);
+    }
+
+    #[test]
+    fn test_process_message_unknown_class() {
+        let armed = make_armed();
+        let mut data = GPSData::default();
+        process_message(r#"{"class": "UNKNOWN"}"#, &mut data, 100.0, &armed);
+        assert!((data.last_seen - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_toff_circular_buffer() {
+        let armed = make_armed();
+        let mut data = GPSData::default();
+
+        // Fill buffer beyond 20
+        for i in 0..25 {
+            let time = format!("2024-01-15T12:30:{:02}.000Z", i);
+            let msg: Value = serde_json::from_str(&format!(
+                r#"{{"class": "TPV", "time": "{}"}}"#,
+                time
+            ))
+            .unwrap();
+            extract_tpv(&msg, &mut data, 1705318200.0 + i as f64, &armed);
+        }
+
+        assert_eq!(data.toff_samples.len(), 20); // capped at 20
+    }
 }

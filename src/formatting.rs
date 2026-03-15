@@ -101,3 +101,146 @@ pub fn fmt_offset(offset_sec: f64) -> String {
         format!("{}{:.3} s", sign, abs)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fmt_finite() {
+        assert_eq!(fmt(3.14159, 2, " m"), "3.14 m");
+        assert_eq!(fmt(0.0, 1, "°"), "0.0°");
+    }
+
+    #[test]
+    fn test_fmt_nan() {
+        assert_eq!(fmt(f64::NAN, 2, " m"), "---");
+        assert_eq!(fmt(f64::INFINITY, 1, ""), "---");
+    }
+
+    #[test]
+    fn test_fmt_coord_dd() {
+        let s = fmt_coord(51.5074, "lat", "dd");
+        assert!(s.contains("51.5074"));
+        assert!(s.contains("N"));
+    }
+
+    #[test]
+    fn test_fmt_coord_south() {
+        let s = fmt_coord(-33.8688, "lat", "dd");
+        assert!(s.contains("S"));
+    }
+
+    #[test]
+    fn test_fmt_coord_west() {
+        let s = fmt_coord(-0.1278, "lon", "dd");
+        assert!(s.contains("W"));
+    }
+
+    #[test]
+    fn test_fmt_coord_dms() {
+        let s = fmt_coord(51.5074, "lat", "dms");
+        assert!(s.contains("51°"));
+        assert!(s.contains("N"));
+    }
+
+    #[test]
+    fn test_fmt_coord_ddm() {
+        let s = fmt_coord(51.5074, "lat", "ddm");
+        assert!(s.contains("51°"));
+        assert!(s.contains("N"));
+    }
+
+    #[test]
+    fn test_fmt_coord_nan() {
+        assert_eq!(fmt_coord(f64::NAN, "lat", "dd"), "---");
+    }
+
+    #[test]
+    fn test_fmt_speed_metric() {
+        assert_eq!(fmt_speed(10.0, "metric"), "36.0 km/h");
+    }
+
+    #[test]
+    fn test_fmt_speed_imperial() {
+        let s = fmt_speed(10.0, "imperial");
+        assert!(s.contains("mph"));
+    }
+
+    #[test]
+    fn test_fmt_speed_nautical() {
+        let s = fmt_speed(10.0, "nautical");
+        assert!(s.contains("kn"));
+    }
+
+    #[test]
+    fn test_fmt_speed_nan() {
+        assert_eq!(fmt_speed(f64::NAN, "metric"), "---");
+    }
+
+    #[test]
+    fn test_fmt_altitude_metric() {
+        assert_eq!(fmt_altitude(100.0, "metric"), "100.0 m");
+    }
+
+    #[test]
+    fn test_fmt_altitude_imperial() {
+        let s = fmt_altitude(100.0, "imperial");
+        assert!(s.contains("ft"));
+    }
+
+    #[test]
+    fn test_fmt_altitude_nan() {
+        assert_eq!(fmt_altitude(f64::NAN, "metric"), "---");
+    }
+
+    #[test]
+    fn test_fmt_time_iso_valid() {
+        let (d, t) = fmt_time_iso("2024-01-15T12:30:00.000Z");
+        assert_eq!(d, "2024-01-15");
+        assert_eq!(t, "12:30:00.000");
+    }
+
+    #[test]
+    fn test_fmt_time_iso_empty() {
+        let (d, t) = fmt_time_iso("");
+        assert_eq!(d, "---");
+        assert_eq!(t, "---");
+    }
+
+    #[test]
+    fn test_fmt_offset_nanoseconds() {
+        let s = fmt_offset(0.5e-9);
+        assert!(s.contains("ns"));
+    }
+
+    #[test]
+    fn test_fmt_offset_microseconds() {
+        let s = fmt_offset(50e-6);
+        assert!(s.contains("us"));
+    }
+
+    #[test]
+    fn test_fmt_offset_milliseconds() {
+        let s = fmt_offset(0.05);
+        assert!(s.contains("ms"));
+    }
+
+    #[test]
+    fn test_fmt_offset_seconds() {
+        let s = fmt_offset(1.5);
+        assert!(s.contains("s"));
+        assert!(!s.contains("ms"));
+    }
+
+    #[test]
+    fn test_fmt_offset_negative() {
+        let s = fmt_offset(-0.05);
+        assert!(s.starts_with('-'));
+    }
+
+    #[test]
+    fn test_fmt_offset_nan() {
+        assert_eq!(fmt_offset(f64::NAN), "---");
+    }
+}

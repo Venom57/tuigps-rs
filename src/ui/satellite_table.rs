@@ -9,7 +9,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let mut sats: Vec<_> = app.gps_data.satellites.iter().collect();
     sats.sort_by(|a, b| a.gnssid.cmp(&b.gnssid).then(a.prn.cmp(&b.prn)));
 
-    let rows: Vec<Row> = sats
+    // Apply scroll offset
+    let visible_height = area.height.saturating_sub(4) as usize; // borders + header
+    let max_offset = sats.len().saturating_sub(visible_height);
+    let offset = app.sat_scroll_offset.min(max_offset);
+    let visible_sats = &sats[offset..sats.len().min(offset + visible_height)];
+
+    let rows: Vec<Row> = visible_sats
         .iter()
         .map(|sat| {
             let color = gnss_color(sat.gnssid);
@@ -29,8 +35,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(gnss_name(sat.gnssid)).style(Style::default().fg(color)),
                 Cell::from(format!("{}", sat.prn)),
                 Cell::from(format!("{}", sat.svid)),
-                Cell::from(fmt(sat.elevation, 0, "°")),
-                Cell::from(fmt(sat.azimuth, 0, "°")),
+                Cell::from(fmt(sat.elevation, 0, "\u{00b0}")),
+                Cell::from(fmt(sat.azimuth, 0, "\u{00b0}")),
                 Cell::from(fmt(sat.snr, 1, "")).style(Style::default().fg(snr_color)),
                 Cell::from(if sat.used { "*" } else { "" })
                     .style(Style::default().fg(Color::Green)),
@@ -49,6 +55,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let scroll_info = if sats.len() > visible_height {
+        format!(" Satellites [{}-{}/{}] ", offset + 1, (offset + visible_sats.len()).min(sats.len()), sats.len())
+    } else {
+        format!(" Satellites ({}) ", sats.len())
+    };
+
     let header = Row::new(["GNSS", "PRN", "SV", "El", "Az", "SNR", "U", "Sig", "Health"])
         .style(Style::default().bold());
 
@@ -66,7 +78,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered().title(" Satellites "));
+        .block(Block::bordered().title(scroll_info));
 
     f.render_widget(table, area);
 }

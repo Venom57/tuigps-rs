@@ -7,6 +7,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io;
+use std::panic;
 
 mod app;
 mod clock_sync;
@@ -30,6 +31,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Set panic hook to restore terminal on crash
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        original_hook(info);
+    }));
 
     // Setup terminal
     enable_raw_mode()?;

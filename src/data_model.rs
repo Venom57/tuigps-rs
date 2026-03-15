@@ -282,3 +282,111 @@ impl GPSData {
         offset_sec * 1e6
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_gpsdata_nan_fields() {
+        let d = GPSData::default();
+        assert!(d.latitude.is_nan());
+        assert!(d.longitude.is_nan());
+        assert!(d.alt_hae.is_nan());
+        assert!(d.speed.is_nan());
+        assert!(d.dop.hdop.is_nan());
+        assert!(d.errors.eph.is_nan());
+    }
+
+    #[test]
+    fn test_default_gpsdata_enums() {
+        let d = GPSData::default();
+        assert_eq!(d.mode, FixMode::Unknown);
+        assert_eq!(d.status, FixStatus::Unknown);
+    }
+
+    #[test]
+    fn test_fixmode_from_u8() {
+        assert_eq!(FixMode::from(0), FixMode::Unknown);
+        assert_eq!(FixMode::from(1), FixMode::NoFix);
+        assert_eq!(FixMode::from(2), FixMode::Fix2D);
+        assert_eq!(FixMode::from(3), FixMode::Fix3D);
+        assert_eq!(FixMode::from(255), FixMode::Unknown);
+    }
+
+    #[test]
+    fn test_fixstatus_from_u8() {
+        assert_eq!(FixStatus::from(1), FixStatus::Gps);
+        assert_eq!(FixStatus::from(3), FixStatus::RtkFix);
+        assert_eq!(FixStatus::from(9), FixStatus::PpsFix);
+        assert_eq!(FixStatus::from(99), FixStatus::Unknown);
+    }
+
+    #[test]
+    fn test_has_fix_3d() {
+        let mut d = GPSData::default();
+        d.mode = FixMode::Fix3D;
+        d.latitude = 51.5;
+        d.longitude = -0.1;
+        assert!(d.has_fix());
+    }
+
+    #[test]
+    fn test_has_fix_2d() {
+        let mut d = GPSData::default();
+        d.mode = FixMode::Fix2D;
+        d.latitude = 51.5;
+        d.longitude = -0.1;
+        assert!(d.has_fix());
+    }
+
+    #[test]
+    fn test_has_fix_nofix() {
+        let mut d = GPSData::default();
+        d.mode = FixMode::NoFix;
+        d.latitude = 51.5;
+        d.longitude = -0.1;
+        assert!(!d.has_fix());
+    }
+
+    #[test]
+    fn test_has_fix_nan_coords() {
+        let mut d = GPSData::default();
+        d.mode = FixMode::Fix3D;
+        // lat/lon are NaN by default
+        assert!(!d.has_fix());
+    }
+
+    #[test]
+    fn test_constellation_counts() {
+        let mut d = GPSData::default();
+        d.satellites = vec![
+            SatelliteInfo { prn: 1, gnssid: 0, svid: 1, elevation: 45.0, azimuth: 180.0, snr: 35.0, used: true, sigid: 0, health: 1, freqid: None },
+            SatelliteInfo { prn: 2, gnssid: 0, svid: 2, elevation: 30.0, azimuth: 90.0, snr: 25.0, used: false, sigid: 0, health: 1, freqid: None },
+            SatelliteInfo { prn: 65, gnssid: 2, svid: 1, elevation: 60.0, azimuth: 270.0, snr: 40.0, used: true, sigid: 0, health: 1, freqid: None },
+        ];
+        let counts = d.constellation_counts();
+        assert_eq!(counts[&0], (2, 1)); // GPS: 2 visible, 1 used
+        assert_eq!(counts[&2], (1, 1)); // Galileo: 1 visible, 1 used
+    }
+
+    #[test]
+    fn test_pps_offset_us() {
+        let mut d = GPSData::default();
+        // 1 second difference
+        d.pps.real_sec = 1001;
+        d.pps.real_nsec = 0;
+        d.pps.clock_sec = 1000;
+        d.pps.clock_nsec = 0;
+        let offset = d.pps_offset_us();
+        assert!((offset - 1_000_000.0).abs() < 1e-6); // 1s = 1_000_000 us
+
+        // Sub-microsecond difference
+        d.pps.real_sec = 1000;
+        d.pps.real_nsec = 500;
+        d.pps.clock_sec = 1000;
+        d.pps.clock_nsec = 0;
+        let offset = d.pps_offset_us();
+        assert!((offset - 0.5).abs() < 1e-6); // 500ns = 0.5us
+    }
+}

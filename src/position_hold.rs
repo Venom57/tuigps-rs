@@ -94,3 +94,56 @@ impl PositionHold {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_result() {
+        let hold = PositionHold::new();
+        assert!(hold.result().is_none());
+    }
+
+    #[test]
+    fn test_single_fix() {
+        let mut hold = PositionHold::new();
+        hold.add_fix(51.5, -0.1, 100.0);
+        assert!(hold.result().is_none()); // need at least 2
+    }
+
+    #[test]
+    fn test_two_fixes() {
+        let mut hold = PositionHold::new();
+        hold.add_fix(51.5000, -0.1000, 100.0);
+        hold.add_fix(51.5001, -0.1001, 101.0);
+        let r = hold.result().unwrap();
+        assert_eq!(r.count, 2);
+        assert!((r.mean_lat - 51.50005).abs() < 1e-6);
+        assert!(r.cep50 > 0.0);
+        assert!(r.cep95 > r.cep50);
+    }
+
+    #[test]
+    fn test_nan_fix_ignored() {
+        let mut hold = PositionHold::new();
+        hold.add_fix(51.5, -0.1, 100.0);
+        hold.add_fix(f64::NAN, f64::NAN, 100.0);
+        hold.add_fix(51.5001, -0.1001, 101.0);
+        let r = hold.result().unwrap();
+        assert_eq!(r.count, 2); // NaN fix was skipped
+    }
+
+    #[test]
+    fn test_many_fixes_convergence() {
+        let mut hold = PositionHold::new();
+        // Feed 100 identical positions
+        for _ in 0..100 {
+            hold.add_fix(51.5, -0.1, 100.0);
+        }
+        let r = hold.result().unwrap();
+        assert_eq!(r.count, 100);
+        assert!((r.mean_lat - 51.5).abs() < 1e-10);
+        assert!(r.cep50 < 0.01); // should be essentially zero
+    }
+}

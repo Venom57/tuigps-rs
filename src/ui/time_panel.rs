@@ -37,8 +37,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         ]));
 
         // TOFF stats
-        if !data.toff_samples.is_empty() {
-            if let Some((mean, std, min, max)) = toff_stats(&data.toff_samples) {
+        if !data.toff_samples.is_empty()
+            && let Some((mean, std, min, max)) = toff_stats(&data.toff_samples) {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(format!("TOFF samples: {}", data.toff_samples.len())));
                 lines.push(Line::from(format!("  Mean: {}", fmt_offset(mean))));
@@ -46,7 +46,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
                 lines.push(Line::from(format!("  Min:  {}", fmt_offset(min))));
                 lines.push(Line::from(format!("  Max:  {}", fmt_offset(max))));
             }
-        }
 
         // Armed TOFF
         if data.toff_armed_offset.is_finite() {
