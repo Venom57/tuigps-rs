@@ -1,12 +1,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{App, SettingsField};
+use crate::app::{App, CoordFormat, SettingsField, UnitSystem};
 
 pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, area);
 
-    let dialog_area = centered_rect(60, 16, area);
+    let dialog_area = centered_rect(62, 20, area);
     let block = Block::bordered()
         .title(" Settings ")
         .style(Style::default().bg(Color::DarkGray));
@@ -16,8 +16,24 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     let sel = app.settings_field;
     let editing = app.settings_editing;
 
+    let units_desc = match app.units {
+        UnitSystem::Metric => "km/h, meters",
+        UnitSystem::Imperial => "mph, feet",
+        UnitSystem::Nautical => "knots, feet",
+    };
+
+    let coord_desc = match app.coord_format {
+        CoordFormat::DD => "51.5074000\u{00b0} N",
+        CoordFormat::DMS => "51\u{00b0} 30' 26.640\" N",
+        CoordFormat::DDM => "51\u{00b0} 30.444000' N",
+    };
+
     let lines = vec![
         Line::raw(""),
+        Line::styled(
+            "  Connection",
+            Style::default().fg(Color::White).bold(),
+        ),
         render_field(
             "Host",
             if editing && sel == SettingsField::Host {
@@ -27,6 +43,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             },
             sel == SettingsField::Host,
             editing && sel == SettingsField::Host,
+            "gpsd hostname or IP",
         ),
         render_field(
             "Port",
@@ -37,25 +54,40 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             },
             sel == SettingsField::Port,
             editing && sel == SettingsField::Port,
+            "gpsd port (default 2947)",
         ),
         Line::raw(""),
+        Line::styled(
+            "  Display",
+            Style::default().fg(Color::White).bold(),
+        ),
         render_cycle_field(
             "Units",
             app.units.as_str(),
             sel == SettingsField::Units,
+            units_desc,
         ),
         render_cycle_field(
             "Coords",
-            app.coord_format.as_str(),
+            app.coord_format.as_str().to_uppercase().as_str(),
             sel == SettingsField::CoordFormat,
+            coord_desc,
         ),
         Line::raw(""),
         Line::styled(
-            "  Up/Down: navigate  Enter: edit/cycle  Esc: close",
+            "  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             Style::default().fg(Color::DarkGray),
         ),
         Line::styled(
-            "  Ctrl+S: apply & reconnect",
+            "  Up/Down  navigate    Enter  edit / cycle value",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::styled(
+            "  \u{2190}/\u{2192}    cycle value  Esc    close",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::styled(
+            "  Ctrl+S   apply & reconnect to gpsd",
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -63,7 +95,13 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_field<'a>(label: &str, value: &str, selected: bool, editing: bool) -> Line<'a> {
+fn render_field<'a>(
+    label: &str,
+    value: &str,
+    selected: bool,
+    editing: bool,
+    hint: &str,
+) -> Line<'a> {
     let marker = if selected { "> " } else { "  " };
     let value_style = if editing {
         Style::default().fg(Color::Yellow).bg(Color::Black).bold()
@@ -79,27 +117,42 @@ fn render_field<'a>(label: &str, value: &str, selected: bool, editing: bool) -> 
         value.to_string()
     };
 
+    let hint_text = if selected {
+        format!("  ({})", hint)
+    } else {
+        String::new()
+    };
+
     Line::from(vec![
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::raw(format!("{:<8}", format!("{}:", label))),
         Span::styled(display, value_style),
+        Span::styled(hint_text, Style::default().fg(Color::DarkGray)),
     ])
 }
 
-fn render_cycle_field<'a>(label: &str, value: &str, selected: bool) -> Line<'a> {
+fn render_cycle_field<'a>(
+    label: &str,
+    value: &str,
+    selected: bool,
+    description: &str,
+) -> Line<'a> {
     let marker = if selected { "> " } else { "  " };
     let value_style = if selected {
         Style::default().fg(Color::Yellow).bold()
     } else {
         Style::default().fg(Color::Gray)
     };
-    let arrows = if selected { " <  > " } else { "" };
+    let arrows = if selected { " \u{25c0} \u{25b6} " } else { "" };
+
+    let desc_text = format!("  {}", description);
 
     Line::from(vec![
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::raw(format!("{:<8}", format!("{}:", label))),
         Span::styled(value.to_string(), value_style),
         Span::styled(arrows, Style::default().fg(Color::DarkGray)),
+        Span::styled(desc_text, Style::default().fg(Color::DarkGray)),
     ])
 }
 
