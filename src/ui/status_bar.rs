@@ -85,6 +85,14 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         _ => {}
     }
 
+    // Status message (visible on all tabs)
+    if !app.status_message.is_empty() {
+        spans.push(Span::styled(
+            format!(" {} ", app.status_message),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
     // Activity badges
     if app.logger.as_ref().is_some_and(|l| l.active) {
         spans.push(Span::styled(

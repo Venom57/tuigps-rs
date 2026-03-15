@@ -305,9 +305,62 @@ impl App {
     pub fn handle_gpsd_event(&mut self, event: GpsdEvent) {
         match event {
             GpsdEvent::Update(data) => {
+                // Preserve app-managed TOFF state across gpsd updates
+                let toff_samples = std::mem::take(&mut self.gps_data.toff_samples);
+                let toff_armed_offset = self.gps_data.toff_armed_offset;
+                let toff_armed_gps_time =
+                    std::mem::take(&mut self.gps_data.toff_armed_gps_time);
+                let toff_armed_sys_time = self.gps_data.toff_armed_sys_time;
+
                 self.gps_data = *data;
+
+                // Restore app-managed TOFF state
+                self.gps_data.toff_samples = toff_samples;
+                self.gps_data.toff_armed_offset = toff_armed_offset;
+                self.gps_data.toff_armed_gps_time = toff_armed_gps_time;
+                self.gps_data.toff_armed_sys_time = toff_armed_sys_time;
+
                 self.stale = false;
                 self.stale_seconds = 0.0;
+
+                // Compute TOFF offset from GPS time vs receipt time
+                if !self.gps_data.time.is_empty() && self.gps_data.last_seen > 0.0 {
+                    if let Ok(gps_time) =
+                        chrono::DateTime::parse_from_rfc3339(&self.gps_data.time)
+                    {
+                        let gps_epoch = gps_time.timestamp() as f64
+                            + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
+                        let offset = gps_epoch - self.gps_data.last_seen;
+
+                        // Accumulate in circular buffer (max 20)
+                        if self.gps_data.toff_samples.len() >= 20 {
+                            self.gps_data.toff_samples.remove(0);
+                        }
+                        self.gps_data.toff_samples.push(offset);
+
+                        // Check for armed single-shot TOFF capture
+                        if self
+                            .armed_toff
+                            .compare_exchange(
+                                true,
+                                false,
+                                Ordering::SeqCst,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            self.gps_data.toff_armed_offset = offset;
+                            self.gps_data.toff_armed_gps_time =
+                                self.gps_data.time.clone();
+                            self.gps_data.toff_armed_sys_time =
+                                self.gps_data.last_seen;
+                            self.set_status(format!(
+                                "TOFF captured: {}",
+                                crate::formatting::fmt_offset(offset)
+                            ));
+                        }
+                    }
+                }
 
                 // Log if active
                 if let Some(ref mut logger) = self.logger {
@@ -316,13 +369,14 @@ impl App {
 
                 // Position hold
                 if let Some(ref mut hold) = self.position_hold
-                    && self.gps_data.has_fix() {
-                        hold.add_fix(
-                            self.gps_data.latitude,
-                            self.gps_data.longitude,
-                            self.gps_data.alt_msl,
-                        );
-                    }
+                    && self.gps_data.has_fix()
+                {
+                    hold.add_fix(
+                        self.gps_data.latitude,
+                        self.gps_data.longitude,
+                        self.gps_data.alt_msl,
+                    );
+                }
             }
             GpsdEvent::Error(msg) => {
                 self.gps_data.connected = false;
@@ -518,12 +572,20 @@ impl App {
                 }
                 KeyCode::Char('c') => {
                     self.nmea_buffer.clear();
+                    self.nmea_pause_buffer.clear();
                     self.nmea_scroll_offset = 0;
+                    self.set_status("NMEA buffer cleared");
                 }
                 KeyCode::Char('f') => {
                     self.nmea_filter_idx = (self.nmea_filter_idx + 1) % NMEA_FILTERS.len();
                     self.nmea_filter = NMEA_FILTERS[self.nmea_filter_idx].to_string();
                     self.nmea_scroll_offset = 0;
+                    let label = if self.nmea_filter.is_empty() {
+                        "ALL"
+                    } else {
+                        &self.nmea_filter
+                    };
+                    self.set_status(format!("Filter: {}", label));
                 }
                 KeyCode::Up => {
                     self.nmea_scroll_offset = self.nmea_scroll_offset.saturating_add(1);
@@ -1203,6 +1265,100 @@ mod tests {
     }
 
     #[test]
+    fn test_toff_accumulation_in_app() {
+        let mut app = new_app();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Send update with GPS time
+        let mut data = GPSData::default();
+        data.time = "2024-01-15T12:30:00.000Z".to_string();
+        data.last_seen = now;
+        data.connected = true;
+        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+
+        assert_eq!(app.gps_data.toff_samples.len(), 1);
+    }
+
+    #[test]
+    fn test_toff_circular_buffer_in_app() {
+        let mut app = new_app();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Send 25 updates to overflow the 20-element buffer
+        for i in 0..25 {
+            let mut data = GPSData::default();
+            data.time = format!("2024-01-15T12:30:{:02}.000Z", i % 60);
+            data.last_seen = now + i as f64;
+            data.connected = true;
+            app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+        }
+
+        assert_eq!(app.gps_data.toff_samples.len(), 20); // capped
+    }
+
+    #[test]
+    fn test_toff_arm_and_capture() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Arm the TOFF
+        app.handle_event(key_event(KeyCode::Char('a')));
+        assert!(app.armed_toff.load(Ordering::SeqCst));
+
+        // Send a GPS update with time
+        let mut data = GPSData::default();
+        data.time = "2024-01-15T12:30:00.000Z".to_string();
+        data.last_seen = now;
+        data.connected = true;
+        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+
+        // Armed TOFF should have fired
+        assert!(!app.armed_toff.load(Ordering::SeqCst));
+        assert!(app.gps_data.toff_armed_offset.is_finite());
+        assert_eq!(app.gps_data.toff_armed_gps_time, "2024-01-15T12:30:00.000Z");
+        assert!(app.status_message.contains("captured"));
+    }
+
+    #[test]
+    fn test_toff_clear_persists_across_updates() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Accumulate some TOFF data
+        let mut data = GPSData::default();
+        data.time = "2024-01-15T12:30:00.000Z".to_string();
+        data.last_seen = now;
+        data.connected = true;
+        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+        assert!(!app.gps_data.toff_samples.is_empty());
+
+        // Clear it
+        app.handle_event(key_event(KeyCode::Char('c')));
+        assert!(app.gps_data.toff_samples.is_empty());
+
+        // Send another update WITHOUT time — toff_samples should stay empty
+        let mut data2 = GPSData::default();
+        data2.connected = true;
+        data2.last_seen = now + 1.0;
+        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data2)));
+        assert!(app.gps_data.toff_samples.is_empty()); // preserved!
+    }
+
+    #[test]
     fn test_gpsd_error() {
         let mut app = new_app();
         app.gps_data.connected = true;
@@ -1220,14 +1376,12 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
     let (tx, mut rx) = mpsc::channel(100);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Spawn gpsd task with armed TOFF
-    let armed_toff = app.armed_toff.clone();
+    // Spawn gpsd task
     let mut gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
         host.to_string(),
         port,
         tx.clone(),
         shutdown_rx.clone(),
-        armed_toff.clone(),
     ));
 
     // Event stream
@@ -1259,13 +1413,11 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
             app.gps_data.error_message = "Reconnecting...".to_string();
             app.stale = false;
 
-            let new_armed = app.armed_toff.clone();
             gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
                 app.host.clone(),
                 app.port,
                 tx.clone(),
                 shutdown_rx.clone(),
-                new_armed,
             ));
         }
 
