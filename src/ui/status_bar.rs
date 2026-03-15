@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::App;
+use crate::app::{ActiveTab, App};
 use crate::constants::gnss_short;
 
 pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -9,6 +9,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     let mut spans = vec![];
 
+    // Global keybindings
     for (key, action) in &[
         ("q", "quit"),
         ("r", "reconnect"),
@@ -23,6 +24,65 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::White).bg(Color::DarkGray),
         ));
         spans.push(Span::raw(format!("{} ", action)));
+    }
+
+    // Tab-specific keybindings
+    match app.active_tab {
+        ActiveTab::Nmea => {
+            spans.push(Span::raw("| "));
+            for (key, action) in &[
+                ("p", "pause"),
+                ("f", "filter"),
+                ("c", "clear"),
+            ] {
+                spans.push(Span::styled(
+                    format!(" {} ", key),
+                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                ));
+                spans.push(Span::raw(format!("{} ", action)));
+            }
+        }
+        ActiveTab::Timing => {
+            spans.push(Span::raw("| "));
+            for (key, action) in &[
+                ("a", "arm"),
+                ("c", "clear"),
+                ("k", "clock"),
+            ] {
+                spans.push(Span::styled(
+                    format!(" {} ", key),
+                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+                ));
+                spans.push(Span::raw(format!("{} ", action)));
+            }
+        }
+        ActiveTab::Satellites => {
+            spans.push(Span::raw("| "));
+            spans.push(Span::styled(
+                " \u{2191}\u{2193} ",
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ));
+            spans.push(Span::raw("scroll "));
+        }
+        ActiveTab::Device => {
+            spans.push(Span::raw("| "));
+            spans.push(Span::styled(
+                " \u{2191}\u{2193} ",
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ));
+            spans.push(Span::raw("select "));
+            spans.push(Span::styled(
+                " \u{2190}\u{2192} ",
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ));
+            spans.push(Span::raw("adjust "));
+            spans.push(Span::styled(
+                " \u{23ce} ",
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ));
+            spans.push(Span::raw("apply "));
+        }
+        _ => {}
     }
 
     // Activity badges
@@ -67,7 +127,8 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         // Constellation breakdown
         let counts = data.constellation_counts();
         if !counts.is_empty() {
-            let mut parts: Vec<(u8, u32, u32)> = counts.into_iter().map(|(id, (v, u))| (id, v, u)).collect();
+            let mut parts: Vec<(u8, u32, u32)> =
+                counts.into_iter().map(|(id, (v, u))| (id, v, u)).collect();
             parts.sort_by_key(|(id, _, _)| *id);
             let breakdown: Vec<String> = parts
                 .iter()

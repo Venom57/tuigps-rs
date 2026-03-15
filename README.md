@@ -46,26 +46,70 @@ gpsfake -c 0.5 /usr/share/gpsd/sample.nmea
 
 ## Keyboard Shortcuts
 
+### Global
+
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
-| `t` | Cycle theme |
 | `s` | Open settings |
 | `r` | Reconnect to gpsd |
 | `u` | Cycle units (metric/imperial/nautical) |
-| `m` | Open position in Google Maps |
-| `l` | Toggle GPS logging |
+| `m` | Open position in Google Maps (requires fix) |
+| `l` | Toggle GPS logging (GPX) |
 | `h` | Toggle position hold |
 | `Tab` | Next tab |
 | `Shift+Tab` | Previous tab |
 
+### Satellites Tab
+
+| Key | Action |
+|-----|--------|
+| `Up/Down` | Scroll satellite table |
+| `PageUp/PageDown` | Scroll satellite table (fast) |
+
+### Timing Tab
+
+| Key | Action |
+|-----|--------|
+| `a` | Arm single-shot TOFF capture |
+| `c` | Clear TOFF samples and armed data |
+| `k` | Sync system clock from GPS time |
+
+### Device Tab
+
+| Key | Action |
+|-----|--------|
+| `Up/Down` | Select control |
+| `Left/Right` | Adjust value / toggle |
+| `Enter` | Apply selected control |
+
+### NMEA Tab
+
+| Key | Action |
+|-----|--------|
+| `p` | Pause/resume NMEA stream |
+| `f` | Cycle sentence filter (ALL/GGA/RMC/GSA/GSV/VTG/GLL/ZDA) |
+| `c` | Clear NMEA buffer |
+| `Up/Down` | Scroll |
+| `PageUp/PageDown` | Scroll (fast) |
+
+### Settings Overlay
+
+| Key | Action |
+|-----|--------|
+| `Up/Down` | Navigate fields |
+| `Enter` | Edit text field / cycle value |
+| `Left/Right` | Cycle value (Units, Coords) |
+| `Esc` | Close settings / cancel edit |
+| `Ctrl+S` | Apply settings and reconnect |
+
 ## Tabs
 
 1. **Dashboard** — grid layout with position, fix, velocity, sky plot, signal chart, errors, device, time
-2. **Satellites** — constellation summary and detailed satellite table
-3. **Timing** — PPS/TOFF details, armed measurements, TOFF statistics
-4. **Device** — u-blox configuration (nav rate, power, PPS, constellations, serial, clock sync)
-5. **NMEA** — raw NMEA sentence viewer with filtering
+2. **Satellites** — constellation summary and detailed satellite table (scrollable)
+3. **Timing** — PPS/TOFF details, armed measurements, TOFF statistics, clock sync
+4. **Device** — u-blox configuration (nav rate, power, PPS, constellations, serial speed)
+5. **NMEA** — raw NMEA sentence viewer with filtering, pause, color coding
 
 ## License
 

@@ -666,6 +666,484 @@ impl App {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn key_event_mod(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn new_app() -> App {
+        App::new("localhost".to_string(), 2947)
+    }
+
+    // === Global keybindings ===
+
+    #[test]
+    fn test_quit() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_reconnect() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('r')));
+        assert!(app.reconnect_requested);
+    }
+
+    #[test]
+    fn test_settings_open_close() {
+        let mut app = new_app();
+        assert!(!app.show_settings);
+        app.handle_event(key_event(KeyCode::Char('s')));
+        assert!(app.show_settings);
+        app.handle_event(key_event(KeyCode::Esc));
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn test_cycle_units() {
+        let mut app = new_app();
+        assert_eq!(app.units, UnitSystem::Metric);
+        app.handle_event(key_event(KeyCode::Char('u')));
+        assert_eq!(app.units, UnitSystem::Imperial);
+        app.handle_event(key_event(KeyCode::Char('u')));
+        assert_eq!(app.units, UnitSystem::Nautical);
+        app.handle_event(key_event(KeyCode::Char('u')));
+        assert_eq!(app.units, UnitSystem::Metric);
+    }
+
+    #[test]
+    fn test_toggle_logging() {
+        let mut app = new_app();
+        assert!(app.logger.is_none());
+        app.handle_event(key_event(KeyCode::Char('l')));
+        // Logger should be Some if file creation succeeded, None if it failed
+        // (depends on filesystem, so just verify no crash)
+    }
+
+    #[test]
+    fn test_toggle_hold() {
+        let mut app = new_app();
+        assert!(app.position_hold.is_none());
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(app.position_hold.is_some());
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(app.position_hold.is_none());
+    }
+
+    #[test]
+    fn test_tab_switching() {
+        let mut app = new_app();
+        assert_eq!(app.active_tab, ActiveTab::Dashboard);
+        app.handle_event(key_event(KeyCode::Tab));
+        assert_eq!(app.active_tab, ActiveTab::Satellites);
+        app.handle_event(key_event(KeyCode::Tab));
+        assert_eq!(app.active_tab, ActiveTab::Timing);
+        app.handle_event(key_event(KeyCode::Tab));
+        assert_eq!(app.active_tab, ActiveTab::Device);
+        app.handle_event(key_event(KeyCode::Tab));
+        assert_eq!(app.active_tab, ActiveTab::Nmea);
+        app.handle_event(key_event(KeyCode::Tab));
+        assert_eq!(app.active_tab, ActiveTab::Dashboard); // wraps
+    }
+
+    #[test]
+    fn test_backtab() {
+        let mut app = new_app();
+        assert_eq!(app.active_tab, ActiveTab::Dashboard);
+        app.handle_event(key_event(KeyCode::BackTab));
+        assert_eq!(app.active_tab, ActiveTab::Nmea); // wraps backwards
+    }
+
+    // === Settings overlay ===
+
+    #[test]
+    fn test_settings_field_navigation() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open settings
+        assert_eq!(app.settings_field, SettingsField::Host);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::Port);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::Units);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::CoordFormat);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::Host); // wraps
+
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.settings_field, SettingsField::CoordFormat); // wraps back
+    }
+
+    #[test]
+    fn test_settings_edit_host() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open
+        assert_eq!(app.settings_field, SettingsField::Host);
+
+        app.handle_event(key_event(KeyCode::Enter)); // start editing
+        assert!(app.settings_editing);
+        assert_eq!(app.settings_edit_buf, "localhost");
+
+        // Clear and type new host
+        for _ in 0..9 {
+            app.handle_event(key_event(KeyCode::Backspace));
+        }
+        for c in "10.0.0.1".chars() {
+            app.handle_event(key_event(KeyCode::Char(c)));
+        }
+        assert_eq!(app.settings_edit_buf, "10.0.0.1");
+
+        app.handle_event(key_event(KeyCode::Enter)); // apply
+        assert!(!app.settings_editing);
+        assert_eq!(app.host, "10.0.0.1");
+    }
+
+    #[test]
+    fn test_settings_edit_cancel() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Enter)); // start editing host
+        app.handle_event(key_event(KeyCode::Backspace));
+        app.handle_event(key_event(KeyCode::Esc)); // cancel
+        assert!(!app.settings_editing);
+        assert_eq!(app.host, "localhost"); // unchanged
+    }
+
+    #[test]
+    fn test_settings_cycle_units() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open
+        // Navigate to Units field
+        app.handle_event(key_event(KeyCode::Down)); // Port
+        app.handle_event(key_event(KeyCode::Down)); // Units
+        assert_eq!(app.settings_field, SettingsField::Units);
+
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(app.units, UnitSystem::Imperial);
+
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.units, UnitSystem::Nautical);
+    }
+
+    #[test]
+    fn test_settings_cycle_coord_format() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open
+        // Navigate to CoordFormat
+        app.handle_event(key_event(KeyCode::Down)); // Port
+        app.handle_event(key_event(KeyCode::Down)); // Units
+        app.handle_event(key_event(KeyCode::Down)); // CoordFormat
+        assert_eq!(app.settings_field, SettingsField::CoordFormat);
+
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(app.coord_format, CoordFormat::DMS);
+    }
+
+    #[test]
+    fn test_settings_ctrl_s() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open
+        assert!(app.show_settings);
+
+        app.handle_event(key_event_mod(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.show_settings);
+        assert!(app.reconnect_requested);
+    }
+
+    #[test]
+    fn test_settings_blocks_global_keys() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s'))); // open settings
+        assert!(app.show_settings);
+
+        // 'q' should NOT quit while settings is open
+        app.handle_event(key_event(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert!(app.show_settings);
+    }
+
+    // === NMEA tab ===
+
+    #[test]
+    fn test_nmea_pause() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        assert!(!app.nmea_paused);
+
+        app.handle_event(key_event(KeyCode::Char('p')));
+        assert!(app.nmea_paused);
+
+        app.handle_event(key_event(KeyCode::Char('p')));
+        assert!(!app.nmea_paused);
+    }
+
+    #[test]
+    fn test_nmea_clear() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        app.nmea_buffer.push_back("$GPGGA,test".to_string());
+        assert!(!app.nmea_buffer.is_empty());
+
+        app.handle_event(key_event(KeyCode::Char('c')));
+        assert!(app.nmea_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_nmea_filter_cycle() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        assert_eq!(app.nmea_filter, "");
+
+        app.handle_event(key_event(KeyCode::Char('f')));
+        assert_eq!(app.nmea_filter, "GGA");
+
+        app.handle_event(key_event(KeyCode::Char('f')));
+        assert_eq!(app.nmea_filter, "RMC");
+    }
+
+    #[test]
+    fn test_nmea_scroll() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.nmea_scroll_offset, 1);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.nmea_scroll_offset, 0);
+
+        app.handle_event(key_event(KeyCode::PageUp));
+        assert_eq!(app.nmea_scroll_offset, 20);
+
+        app.handle_event(key_event(KeyCode::PageDown));
+        assert_eq!(app.nmea_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_nmea_pause_buffer() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+
+        // Pause
+        app.handle_event(key_event(KeyCode::Char('p')));
+        assert!(app.nmea_paused);
+
+        // Simulate NMEA arriving while paused
+        app.handle_gpsd_event(GpsdEvent::Nmea("$GPGGA,paused".to_string()));
+        assert_eq!(app.nmea_pause_buffer.len(), 1);
+        assert_eq!(app.nmea_buffer.len(), 0);
+
+        // Unpause - buffer should merge
+        app.handle_event(key_event(KeyCode::Char('p')));
+        assert!(!app.nmea_paused);
+        assert_eq!(app.nmea_buffer.len(), 1);
+        assert_eq!(app.nmea_pause_buffer.len(), 0);
+    }
+
+    // === Timing tab ===
+
+    #[test]
+    fn test_timing_arm_toff() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+
+        app.handle_event(key_event(KeyCode::Char('a')));
+        assert!(app.armed_toff.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_timing_clear_toff() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        app.gps_data.toff_samples = vec![1.0, 2.0, 3.0];
+        app.gps_data.toff_armed_offset = 0.5;
+
+        app.handle_event(key_event(KeyCode::Char('c')));
+        assert!(app.gps_data.toff_samples.is_empty());
+        assert!(app.gps_data.toff_armed_offset.is_nan());
+    }
+
+    // === Satellites tab ===
+
+    #[test]
+    fn test_satellite_scroll() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Satellites;
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.sat_scroll_offset, 1);
+
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.sat_scroll_offset, 0);
+
+        // Can't scroll below 0
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.sat_scroll_offset, 0);
+    }
+
+    // === Device tab ===
+
+    #[test]
+    fn test_device_control_navigation() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        assert_eq!(app.device_config.selected_control, 0);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.device_config.selected_control, 1);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.device_config.selected_control, 2);
+
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.device_config.selected_control, 1);
+
+        // Can't go below 0
+        app.handle_event(key_event(KeyCode::Up));
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.device_config.selected_control, 0);
+    }
+
+    #[test]
+    fn test_device_adjust_nav_rate() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        app.device_config.selected_control = 0; // Nav rate
+        assert_eq!(app.device_config.nav_rate_idx, 0);
+
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.device_config.nav_rate_idx, 1);
+
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.device_config.nav_rate_idx, 0);
+
+        // Wraps
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.device_config.nav_rate_idx, NAV_RATES.len() - 1);
+    }
+
+    #[test]
+    fn test_device_gnss_toggle() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        app.device_config.selected_control = 4; // First GNSS toggle (GPS)
+        assert!(app.device_config.gnss_enabled[0]);
+
+        app.handle_event(key_event(KeyCode::Right)); // toggle
+        assert!(!app.device_config.gnss_enabled[0]);
+
+        app.handle_event(key_event(KeyCode::Left)); // toggle back
+        assert!(app.device_config.gnss_enabled[0]);
+    }
+
+    #[test]
+    fn test_device_activate() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        app.device_config.selected_control = 0;
+        assert!(app.device_config.output_log.is_empty());
+
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(app.device_config.output_log.len(), 1);
+        assert!(app.device_config.output_log[0].contains("nav rate"));
+    }
+
+    // === Tab-specific keys don't fire on wrong tab ===
+
+    #[test]
+    fn test_nmea_keys_only_on_nmea_tab() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Dashboard;
+        app.nmea_buffer.push_back("test".to_string());
+
+        // 'c' on Dashboard should not clear NMEA buffer
+        app.handle_event(key_event(KeyCode::Char('c')));
+        assert!(!app.nmea_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_timing_keys_only_on_timing_tab() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Dashboard;
+
+        // 'a' on Dashboard should not arm TOFF
+        app.handle_event(key_event(KeyCode::Char('a')));
+        assert!(!app.armed_toff.load(Ordering::SeqCst));
+    }
+
+    // === Staleness detection ===
+
+    #[test]
+    fn test_staleness() {
+        let mut app = new_app();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Recent data - not stale
+        app.gps_data.last_seen = now;
+        app.tick();
+        assert!(!app.stale);
+
+        // Old data - stale
+        app.gps_data.last_seen = now - 15.0;
+        app.tick();
+        assert!(app.stale);
+        assert!(app.stale_seconds > 10.0);
+    }
+
+    // === GPS event handling ===
+
+    #[test]
+    fn test_gpsd_update_clears_stale() {
+        let mut app = new_app();
+        app.stale = true;
+        app.stale_seconds = 15.0;
+
+        app.handle_gpsd_event(GpsdEvent::Update(Box::new(GPSData::default())));
+        assert!(!app.stale);
+        assert_eq!(app.stale_seconds, 0.0);
+    }
+
+    #[test]
+    fn test_gpsd_error() {
+        let mut app = new_app();
+        app.gps_data.connected = true;
+
+        app.handle_gpsd_event(GpsdEvent::Error("connection refused".to_string()));
+        assert!(!app.gps_data.connected);
+        assert_eq!(app.gps_data.error_message, "connection refused");
+    }
+}
+
 pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
     let mut app = App::new(host.to_string(), port);
 

@@ -11,9 +11,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let title = format!(
-        " NMEA [{}]{} ",
+        " NMEA [{}]{} ({}) ",
         filter_label,
         if app.nmea_paused { " [PAUSED]" } else { "" },
+        app.nmea_buffer.len(),
     );
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
@@ -36,6 +37,28 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             }
         })
         .collect();
+
+    if filtered.is_empty() {
+        // Show help when empty
+        let help = vec![
+            Line::raw(""),
+            Line::styled(
+                "  Waiting for NMEA sentences...",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "  p: pause/resume  f: cycle filter  c: clear",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::styled(
+                "  Up/Down: scroll  PageUp/PageDown: fast scroll",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        f.render_widget(Paragraph::new(help), inner);
+        return;
+    }
 
     // Apply scroll offset (offset is from the bottom)
     let total = filtered.len();
