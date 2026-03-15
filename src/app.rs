@@ -321,6 +321,7 @@ impl App {
                 let toff_armed_gps_time =
                     std::mem::take(&mut self.gps_data.toff_armed_gps_time);
                 let toff_armed_sys_time = self.gps_data.toff_armed_sys_time;
+                let prev_time = std::mem::take(&mut self.gps_data.time);
 
                 self.gps_data = *data;
 
@@ -333,10 +334,14 @@ impl App {
                 self.stale = false;
                 self.stale_seconds = 0.0;
 
-                // Compute TOFF offset from GPS time vs receipt time
-                if !self.gps_data.time.is_empty() && self.gps_data.last_seen > 0.0 {
+                // Compute TOFF offset only when GPS time changes (new TPV)
+                let new_time = &self.gps_data.time;
+                if !new_time.is_empty()
+                    && *new_time != prev_time
+                    && self.gps_data.last_seen > 0.0
+                {
                     if let Ok(gps_time) =
-                        chrono::DateTime::parse_from_rfc3339(&self.gps_data.time)
+                        chrono::DateTime::parse_from_rfc3339(new_time)
                     {
                         let gps_epoch = gps_time.timestamp() as f64
                             + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
