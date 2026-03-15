@@ -11,7 +11,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     let w = inner.width as usize;
     let h = inner.height as usize;
-    if w < 10 || h < 6 {
+    if w < 8 || h < 4 {
         return;
     }
 
@@ -23,8 +23,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let cx = w / 2;
     let cy = h / 2;
     // Separate X/Y radii for aspect ratio (terminal chars are ~2:1)
-    let max_rx = (cx as i32 - 4).max(8) as usize;
-    let max_ry = (cy as i32 - 2).max(4) as usize;
+    // Leave room for cardinal labels outside the rings
+    let max_rx = cx.saturating_sub(3).max(2);
+    let max_ry = cy.saturating_sub(1).max(1);
 
     // Draw concentric elevation rings at 0°, 30°, 60°
     for elev_deg in [0, 30, 60] {
