@@ -786,14 +786,20 @@ impl App {
         let _ = tx.try_send(cmd_str);
 
         tokio::spawn(async move {
-            match tokio::process::Command::new("ubxtool")
-                .args(&full_args)
-                .output()
-                .await
-            {
-                Ok(output) => {
-                    let mut result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("ubxtool")
+                    .args(&full_args)
+                    .output(),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let mut result =
+                        String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let stderr =
+                        String::from_utf8_lossy(&output.stderr).trim().to_string();
                     if !stderr.is_empty() {
                         if !result.is_empty() {
                             result.push('\n');
@@ -805,13 +811,16 @@ impl App {
                     }
                     let _ = tx.send(result).await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let msg = if e.kind() == std::io::ErrorKind::NotFound {
                         "Error: ubxtool not found (install gpsd-clients)".to_string()
                     } else {
                         format!("Error: {}", e)
                     };
                     let _ = tx.send(msg).await;
+                }
+                Err(_) => {
+                    let _ = tx.send("Error: command timed out (10s)".to_string()).await;
                 }
             }
         });
@@ -825,52 +834,73 @@ impl App {
 
         tokio::spawn(async move {
             // Step 1: Tell receiver to switch baud rate
-            match tokio::process::Command::new("ubxtool")
-                .args(["-P", &proto, "-S", &speed_str])
-                .output()
-                .await
-            {
-                Ok(output) => {
+            let step1 = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("ubxtool")
+                    .args(["-P", &proto, "-S", &speed_str])
+                    .output(),
+            )
+            .await;
+
+            match step1 {
+                Ok(Ok(output)) => {
                     let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let combined = if err.is_empty() { out } else { format!("{}\n{}", out, err) };
+                    let combined =
+                        if err.is_empty() { out } else { format!("{}\n{}", out, err) };
                     if !combined.trim().is_empty() {
                         let _ = tx.send(combined).await;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = tx.send(format!("ubxtool error: {}", e)).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send("ubxtool timed out (10s)".to_string())
+                        .await;
                     return;
                 }
             }
 
             // Step 2: Tell gpsd the new speed
-            let mut gpsctl_args = vec!["-s", &speed_str];
+            let mut gpsctl_args = vec!["-s".to_string(), speed_str.clone()];
             if !device.is_empty() {
-                gpsctl_args.push(&device);
+                gpsctl_args.push(device.clone());
             }
-            match tokio::process::Command::new("gpsctl")
-                .args(&gpsctl_args)
-                .output()
-                .await
-            {
-                Ok(output) => {
+            let step2 = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("gpsctl")
+                    .args(&gpsctl_args)
+                    .output(),
+            )
+            .await;
+
+            match step2 {
+                Ok(Ok(output)) => {
                     if output.status.success() {
                         let dev_name = if device.is_empty() {
-                            "default device"
+                            "default device".to_string()
                         } else {
-                            &device
+                            device
                         };
                         let _ = tx
                             .send(format!("Baud rate set to {} on {}", speed_str, dev_name))
                             .await;
                     } else {
-                        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let err =
+                            String::from_utf8_lossy(&output.stderr).trim().to_string();
                         let _ = tx.send(format!("gpsctl error: {}", err)).await;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = tx.send(format!("gpsctl error: {}", e)).await;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send("gpsctl timed out (10s)".to_string())
+                        .await;
                 }
             }
         });
