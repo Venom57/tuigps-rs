@@ -166,6 +166,9 @@ pub const PPS_FREQUENCIES: &[(&str, u32)] = &[
 
 pub const GNSS_NAMES_CONFIG: &[&str] = &["GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"];
 
+// Names used by ubxtool -e/-d flags
+const GNSS_UBXTOOL_NAMES: &[&str] = &["GPS", "GLONASS", "GALILEO", "BEIDOU", "SBAS", "QZSS"];
+
 // Total number of device config controls
 pub const DEVICE_CONTROL_COUNT: usize = 11; // nav_rate, power, serial, pps, 6 GNSS toggles, save
 
@@ -232,10 +235,15 @@ pub struct App {
     // Status message (shown on current tab, auto-clears)
     pub status_message: String,
     pub status_message_tick: u32,
+
+    // Channel for async command output (device config)
+    pub cmd_tx: mpsc::Sender<String>,
+    pub cmd_rx: mpsc::Receiver<String>,
 }
 
 impl App {
     pub fn new(host: String, port: u16) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
         Self {
             gps_data: GPSData::default(),
             active_tab: ActiveTab::Dashboard,
@@ -265,6 +273,8 @@ impl App {
             reconnect_requested: false,
             status_message: String::new(),
             status_message_tick: 0,
+            cmd_tx: cmd_tx,
+            cmd_rx: cmd_rx,
         }
     }
 
@@ -717,42 +727,153 @@ impl App {
 
     fn device_config_activate(&mut self) {
         let dc = &mut self.device_config;
+        let proto = dc.proto_version.clone();
         match dc.selected_control {
             0 => {
+                // Nav rate
                 let (name, ms) = NAV_RATES[dc.nav_rate_idx];
-                dc.output_log
-                    .push(format!("Set nav rate: {} ({}ms)", name, ms));
+                dc.output_log.push(format!("Setting nav rate: {} ({}ms)...", name, ms));
+                self.run_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)], &proto);
             }
             1 => {
+                // Power mode
                 let (name, mode) = POWER_MODES[dc.power_mode_idx];
-                dc.output_log
-                    .push(format!("Set power mode: {} ({})", name, mode));
+                dc.output_log.push(format!("Setting power mode: {}...", name));
+                self.run_ubxtool(&["-p", &format!("PMS,{}", mode)], &proto);
             }
             2 => {
+                // Serial speed (two-step: ubxtool then gpsctl)
                 let speed = SERIAL_SPEEDS[dc.serial_speed_idx];
-                dc.output_log
-                    .push(format!("Set serial speed: {} baud", speed));
+                let device = self.gps_data.device.path.clone();
+                dc.output_log.push(format!("Setting baud rate to {}...", speed));
+                self.run_baud_rate_change(speed, &device, &proto);
             }
             3 => {
+                // PPS frequency
                 let (name, freq) = PPS_FREQUENCIES[dc.pps_frequency_idx];
-                dc.output_log
-                    .push(format!("Set PPS frequency: {} ({})", name, freq));
+                dc.output_log.push(format!("Setting PPS: {}...", name));
+                let cmd = build_tp5_cmd(freq, 100000, true);
+                self.run_ubxtool(&["-c", &cmd], &proto);
             }
             4..=9 => {
+                // GNSS toggles
                 let idx = dc.selected_control - 4;
                 let name = GNSS_NAMES_CONFIG[idx];
-                let state = if dc.gnss_enabled[idx] {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                dc.output_log.push(format!("{}: {}", name, state));
+                let ubx_name = GNSS_UBXTOOL_NAMES[idx];
+                let enabled = dc.gnss_enabled[idx];
+                let flag = if enabled { "-e" } else { "-d" };
+                let state = if enabled { "Enabling" } else { "Disabling" };
+                dc.output_log.push(format!("{} {}...", state, name));
+                self.run_ubxtool(&[flag, ubx_name], &proto);
             }
             10 => {
-                dc.output_log.push("Save config requested".to_string());
+                // Save config
+                dc.output_log.push("Saving config to flash...".to_string());
+                self.run_ubxtool(&["-p", "SAVE"], &proto);
             }
             _ => {}
         }
+    }
+
+    fn run_ubxtool(&self, args: &[&str], proto_ver: &str) {
+        let tx = self.cmd_tx.clone();
+        let full_args: Vec<String> = ["-P", proto_ver]
+            .iter()
+            .chain(args.iter())
+            .map(|s| s.to_string())
+            .collect();
+        let cmd_str = format!("$ ubxtool {}", full_args.join(" "));
+        let _ = tx.try_send(cmd_str);
+
+        tokio::spawn(async move {
+            match tokio::process::Command::new("ubxtool")
+                .args(&full_args)
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    let mut result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if !stderr.is_empty() {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(&stderr);
+                    }
+                    if result.is_empty() {
+                        result = "(no output)".to_string();
+                    }
+                    let _ = tx.send(result).await;
+                }
+                Err(e) => {
+                    let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                        "Error: ubxtool not found (install gpsd-clients)".to_string()
+                    } else {
+                        format!("Error: {}", e)
+                    };
+                    let _ = tx.send(msg).await;
+                }
+            }
+        });
+    }
+
+    fn run_baud_rate_change(&self, speed: u32, device: &str, proto_ver: &str) {
+        let tx = self.cmd_tx.clone();
+        let proto = proto_ver.to_string();
+        let device = device.to_string();
+        let speed_str = speed.to_string();
+
+        tokio::spawn(async move {
+            // Step 1: Tell receiver to switch baud rate
+            match tokio::process::Command::new("ubxtool")
+                .args(["-P", &proto, "-S", &speed_str])
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let combined = if err.is_empty() { out } else { format!("{}\n{}", out, err) };
+                    if !combined.trim().is_empty() {
+                        let _ = tx.send(combined).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("ubxtool error: {}", e)).await;
+                    return;
+                }
+            }
+
+            // Step 2: Tell gpsd the new speed
+            let mut gpsctl_args = vec!["-s", &speed_str];
+            if !device.is_empty() {
+                gpsctl_args.push(&device);
+            }
+            match tokio::process::Command::new("gpsctl")
+                .args(&gpsctl_args)
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        let dev_name = if device.is_empty() {
+                            "default device"
+                        } else {
+                            &device
+                        };
+                        let _ = tx
+                            .send(format!("Baud rate set to {} on {}", speed_str, dev_name))
+                            .await;
+                    } else {
+                        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let _ = tx.send(format!("gpsctl error: {}", err)).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("gpsctl error: {}", e)).await;
+                }
+            }
+        });
     }
 }
 
@@ -1369,6 +1490,36 @@ mod tests {
     }
 }
 
+/// Build a UBX-CFG-TP5 command string for `ubxtool -c`.
+/// Format: class,id,payload_bytes (comma-separated hex).
+fn build_tp5_cmd(freq_hz: u32, pulse_us: u32, active: bool) -> String {
+    // flags: lockGnssFreq | lockedOtherSet | isFreq | isLength | alignToTow | polarity
+    let mut flags: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40; // 0x7E
+    if active {
+        flags |= 0x01;
+    }
+
+    // Pack as little-endian: BBHhhIIIIiI
+    let mut payload = Vec::with_capacity(32);
+    payload.push(0u8); // tpIdx
+    payload.push(1u8); // version
+    payload.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    payload.extend_from_slice(&0i16.to_le_bytes()); // antCableDelay
+    payload.extend_from_slice(&0i16.to_le_bytes()); // rfGroupDelay
+    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriod
+    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriodLock
+    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatio
+    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatioLock
+    payload.extend_from_slice(&0i32.to_le_bytes()); // userConfigDelay
+    payload.extend_from_slice(&flags.to_le_bytes()); // flags
+
+    let mut parts = vec!["06".to_string(), "31".to_string()];
+    for b in &payload {
+        parts.push(format!("{:02x}", b));
+    }
+    parts.join(",")
+}
+
 pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
     let mut app = App::new(host.to_string(), port);
 
@@ -1395,6 +1546,14 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
             }
             Some(gpsd_event) = rx.recv() => {
                 app.handle_gpsd_event(gpsd_event);
+            }
+            Some(cmd_output) = app.cmd_rx.recv() => {
+                // Split multi-line output into separate log entries
+                for line in cmd_output.lines() {
+                    if !line.trim().is_empty() {
+                        app.device_config.output_log.push(line.to_string());
+                    }
+                }
             }
             _ = tick.tick() => {
                 app.tick();
