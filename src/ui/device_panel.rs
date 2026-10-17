@@ -44,7 +44,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 "---".to_string()
             }
         )),
-        Line::from(format!("Cycle:   {:.1}s", dev.cycle)),
+        Line::from(format!(
+            "Cycle:   {}",
+            if dev.cycle.is_finite() && dev.cycle > 0.0 {
+                format!("{:.2}s", dev.cycle)
+            } else {
+                "---".to_string()
+            }
+        )),
         Line::from(format!(
             "gpsd:    {}",
             if ver.release.is_empty() {

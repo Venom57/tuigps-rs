@@ -59,10 +59,7 @@ fn render_controls(f: &mut Frame, area: Rect, app: &App) {
     ));
 
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " Constellations:",
-        Style::default().fg(Color::White).bold(),
-    ));
+    lines.push(Line::styled(" Constellations:", Style::default().bold()));
 
     // Controls 4-9: GNSS toggles
     for (i, name) in GNSS_NAMES_CONFIG.iter().enumerate() {
@@ -71,9 +68,9 @@ fn render_controls(f: &mut Frame, area: Rect, app: &App) {
         let state = if enabled { "[x]" } else { "[ ]" };
         let color = if enabled { Color::Green } else { Color::Red };
         let name_style = if sel == i + 4 {
-            Style::default().fg(Color::White).bold()
+            Style::default().bold()
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default()
         };
 
         lines.push(Line::from(vec![
@@ -90,7 +87,7 @@ fn render_controls(f: &mut Frame, area: Rect, app: &App) {
     let save_style = if sel == 10 {
         Style::default().fg(Color::Yellow).bold()
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default()
     };
     let save_marker = if sel == 10 { "> " } else { "  " };
     lines.push(Line::from(vec![
@@ -106,7 +103,7 @@ fn control_line<'a>(label: &str, value: &str, selected: bool) -> Line<'a> {
     let value_style = if selected {
         Style::default().fg(Color::Yellow).bold()
     } else {
-        Style::default().fg(Color::White)
+        Style::default()
     };
     let arrows = if selected { " < > " } else { "" };
 

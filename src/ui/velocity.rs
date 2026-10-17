@@ -16,10 +16,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(vec![
             Span::raw("Speed: "),
-            Span::styled(
-                fmt_speed(data.speed, unit),
-                Style::default().fg(Color::White).bold(),
-            ),
+            Span::styled(fmt_speed(data.speed, unit), Style::default().bold()),
         ]),
         Line::from(format!(
             "Track: {} ({})",
@@ -32,4 +29,5 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ];
 
     f.render_widget(Paragraph::new(lines), inner);
+    super::mark_data_state(f, area, app);
 }

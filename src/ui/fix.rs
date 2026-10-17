@@ -35,7 +35,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         data.satellites.len()
     )));
 
-    lines.push(Line::raw(""));
+    // Spacer only when there is room for it plus all four DOP rows, so
+    // PDOP/GDOP stay visible in short panels.
+    if inner.height > 7 {
+        lines.push(Line::raw(""));
+    }
 
     for (label, value) in [
         ("HDOP", data.dop.hdop),
@@ -52,4 +56,5 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+    super::mark_data_state(f, area, app);
 }
