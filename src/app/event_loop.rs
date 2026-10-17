@@ -76,7 +76,11 @@ impl FrameLimiter {
 
 /// Run the TUI until quit. `startup` comes from [`crate::config::startup`]
 /// (config file merged with CLI overrides).
-pub async fn run(terminal: &mut Terminal<impl Backend>, startup: Startup) -> Result<()> {
+pub async fn run<B>(terminal: &mut Terminal<B>, startup: Startup) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+{
     let mut app = App::from_startup(startup);
     let result = event_loop(terminal, &mut app).await;
     // Always close the log so the GPX file is valid, even on error.
@@ -84,7 +88,11 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, startup: Startup) -> Res
     result
 }
 
-async fn event_loop(terminal: &mut Terminal<impl Backend>, app: &mut App) -> Result<()> {
+async fn event_loop<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+{
     // Channel for gpsd events, tagged with the connection generation
     let (tx, mut rx) = mpsc::channel::<TaggedEvent>(100);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
