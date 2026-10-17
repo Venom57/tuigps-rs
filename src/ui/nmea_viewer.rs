@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::App;
+use crate::app::{ActiveTab, App, tab_bindings};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let filter_label = if app.nmea_filter.is_empty() {
@@ -10,55 +10,71 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         app.nmea_filter.as_str()
     };
 
-    let title = format!(
-        " NMEA [{}]{} ({}) ",
-        filter_label,
-        if app.nmea_paused { " [PAUSED]" } else { "" },
-        app.nmea_buffer.len(),
-    );
-    let block = Block::bordered().title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let height = inner.height as usize;
-    if height == 0 {
-        return;
-    }
+    let height = area.height.saturating_sub(2) as usize;
+    // Record the view height so key handling can clamp scroll offsets.
+    app.nmea_view_rows.set(height);
 
     let matches = |s: &&String| app.nmea_filter.is_empty() || nmea_type(s) == app.nmea_filter;
 
     // Count matches without collecting them; only the visible window is
     // gathered below.
-    let total = if app.nmea_filter.is_empty() {
-        app.nmea_buffer.len()
-    } else {
-        app.nmea_buffer.iter().filter(matches).count()
-    };
+    let total = app.nmea_visible_count();
+    // Offset is from the bottom (newest line).
+    let scroll = app.nmea_scroll_offset.min(total.saturating_sub(height));
 
-    if total == 0 {
-        // Show help when empty
-        let help = vec![
-            Line::raw(""),
-            Line::styled(
-                "  Waiting for NMEA sentences...",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Line::raw(""),
-            Line::styled(
-                "  p: pause/resume  f: cycle filter  c: clear",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Line::styled(
-                "  Up/Down: scroll  PageUp/PageDown: fast scroll",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ];
-        f.render_widget(Paragraph::new(help), inner);
+    let (mode, mode_style) = if app.nmea_paused {
+        (
+            " PAUSED (p resumes) ".to_string(),
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
+        )
+    } else if scroll > 0 {
+        (
+            format!(" SCROLLED +{} (End follows) ", scroll),
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+        )
+    } else {
+        (
+            " FOLLOWING ".to_string(),
+            Style::default().fg(Color::Green).bold(),
+        )
+    };
+    let title = Line::from(vec![
+        Span::raw(format!(
+            " NMEA [{}] ({}) ",
+            filter_label,
+            app.nmea_buffer.len()
+        )),
+        Span::styled(mode, mode_style),
+        Span::raw(" "),
+    ]);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if height == 0 {
         return;
     }
 
-    // Apply scroll offset (offset is from the bottom)
-    let scroll = app.nmea_scroll_offset.min(total.saturating_sub(height));
+    if total == 0 {
+        // Show help when empty, generated from the key binding table.
+        let mut help = vec![
+            Line::raw(""),
+            Line::styled("  Waiting for NMEA sentences...", Style::default().italic()),
+            Line::raw(""),
+        ];
+        for b in tab_bindings(ActiveTab::Nmea) {
+            help.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<10}", b.label),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Span::raw(b.desc),
+            ]));
+        }
+        f.render_widget(Paragraph::new(help), inner);
+        return;
+    }
 
     // Walk backwards from the newest line, skipping the scrolled-off tail,
     // and borrow just the lines that fit.
@@ -78,21 +94,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     f.render_widget(Paragraph::new(lines), inner);
-
-    // Show scroll indicator if not at bottom
-    if scroll > 0 {
-        let indicator = format!(" +{} ", scroll);
-        let indicator_area = Rect::new(
-            inner.x + inner.width.saturating_sub(indicator.len() as u16 + 1),
-            area.y,
-            (indicator.len() as u16).min(inner.width),
-            1,
-        );
-        f.render_widget(
-            Paragraph::new(indicator).style(Style::default().fg(Color::Yellow)),
-            indicator_area,
-        );
-    }
 }
 
 /// Sentence type used for filtering and coloring.

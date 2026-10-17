@@ -12,6 +12,7 @@ pub mod device_config;
 pub mod device_panel;
 pub mod error_panel;
 pub mod fix;
+pub mod help;
 pub mod nmea_viewer;
 pub mod position;
 pub mod satellite_table;
@@ -33,6 +34,12 @@ pub fn render(f: &mut Frame, app: &App) {
         render_too_small(f, area);
     } else {
         render_main(f, app);
+    }
+
+    // Help is drawn even on a too-small terminal: it is the one thing
+    // still useful there.
+    if app.show_help {
+        help::render_help(f, area, app);
     }
 
     if no_color() {

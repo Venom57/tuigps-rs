@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod clock_sync;
+pub mod config;
 pub mod constants;
 pub mod data_model;
 pub mod formatting;

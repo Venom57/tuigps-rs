@@ -11,6 +11,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
     // Apply scroll offset
     let visible_height = area.height.saturating_sub(3) as usize; // 2 borders + header
+    // Record the view height so key handling can clamp the offset.
+    app.sat_view_rows.set(visible_height);
     let max_offset = sats.len().saturating_sub(visible_height);
     let offset = app.sat_scroll_offset.min(max_offset);
     let visible_sats = &sats[offset..sats.len().min(offset + visible_height)];

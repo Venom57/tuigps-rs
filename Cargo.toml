@@ -49,6 +49,10 @@ anyhow = "1"
 # Async stream for crossterm events
 futures = "0.3"
 
+# Config file (~/.config/tuigps-rs/config.toml)
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "display"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

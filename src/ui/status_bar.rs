@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::constellation_counts;
-use crate::app::{ActiveTab, App};
+use crate::app::{Action, ActiveTab, App, GLOBAL_BINDINGS, KeyBinding, tab_bindings};
 use crate::constants::gnss_short;
 
 /// Columns of key hints we try to keep visible before giving space to the
@@ -28,6 +28,19 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn left_spans(app: &App) -> Vec<Span<'static>> {
+    // A pending device confirmation stays visible until answered.
+    if let Some(confirm) = &app.device_config.confirm {
+        let style = if confirm.destructive() {
+            Style::default().fg(Color::White).bg(Color::Red).bold()
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        };
+        return vec![
+            Span::raw(" "),
+            Span::styled(format!(" {} y/n ", confirm.prompt), style),
+        ];
+    }
+
     // A transient status message temporarily replaces the hints.
     if !app.status_message.is_empty() {
         return vec![Span::styled(
@@ -36,41 +49,38 @@ fn left_spans(app: &App) -> Vec<Span<'static>> {
         )];
     }
 
-    let tab_hints: &[(&str, &str)] = match app.active_tab {
-        ActiveTab::Nmea => &[("p", "pause"), ("f", "filter"), ("c", "clear")],
-        ActiveTab::Timing => &[("a", "arm"), ("c", "clear"), ("k", "clock")],
-        ActiveTab::Satellites => &[("\u{2191}\u{2193}", "scroll")],
-        ActiveTab::Device => &[
-            ("\u{2191}\u{2193}", "select"),
-            ("\u{2190}\u{2192}", "adjust"),
-            ("\u{23ce}", "apply"),
-        ],
-        ActiveTab::Dashboard => &[],
-    };
-    let global_hints: &[(&str, &str)] = &[
-        ("q", "quit"),
-        ("r", "reconnect"),
-        ("s", "settings"),
-        ("u", "units"),
-        ("m", "maps"),
-        ("l", "log"),
-        ("h", "hold"),
-    ];
+    hint_spans(app.active_tab)
+}
 
+/// Key hints generated from the key binding table: `?:help` first, then
+/// the tab's keys (least discoverable), then the global keys.
+fn hint_spans(tab: ActiveTab) -> Vec<Span<'static>> {
     let key_style = Style::default().fg(Color::Yellow).bold();
+    let sep = || Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray));
+    let hint = |b: &KeyBinding, spans: &mut Vec<Span<'static>>| {
+        if let Some(h) = b.hint {
+            spans.push(Span::styled(b.label, key_style));
+            spans.push(Span::raw(format!(":{} ", h)));
+        }
+    };
+
     let mut spans = vec![Span::raw(" ")];
-    // Context-specific keys first; they are the least discoverable.
-    for (i, hints) in [tab_hints, global_hints].into_iter().enumerate() {
-        if i == 1 && !tab_hints.is_empty() {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
+    let (help, globals): (Vec<&KeyBinding>, Vec<&KeyBinding>) = GLOBAL_BINDINGS
+        .iter()
+        .partition(|b| b.action == Action::ToggleHelp);
+    for b in help {
+        hint(b, &mut spans);
+    }
+    spans.push(sep());
+    let tab_bindings = tab_bindings(tab);
+    if tab_bindings.iter().any(|b| b.hint.is_some()) {
+        for b in tab_bindings {
+            hint(b, &mut spans);
         }
-        for (key, action) in hints {
-            spans.push(Span::styled(*key, key_style));
-            spans.push(Span::raw(format!(":{} ", action)));
-        }
+        spans.push(sep());
+    }
+    for b in globals {
+        hint(b, &mut spans);
     }
     spans
 }

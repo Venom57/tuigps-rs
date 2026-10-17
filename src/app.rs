@@ -2,12 +2,15 @@ use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::clock_sync::{self, ClockSyncRequest};
+use crate::config::{self, Config, Startup};
 use crate::data_model::GPSData;
 use crate::gps_logger::{GpsLogger, LogFormat};
 use crate::gpsd_client::{self, GpsdEvent, GpsdMessage, MsgClass, TaggedEvent};
@@ -43,7 +46,8 @@ impl ActiveTab {
     ];
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UnitSystem {
     Metric,
     Imperial,
@@ -66,9 +70,14 @@ impl UnitSystem {
             UnitSystem::Nautical => UnitSystem::Metric,
         }
     }
+
+    fn prev(self) -> Self {
+        self.next().next()
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 #[allow(clippy::upper_case_acronyms)]
 pub enum CoordFormat {
     DD,
@@ -91,6 +100,10 @@ impl CoordFormat {
             CoordFormat::DMS => CoordFormat::DDM,
             CoordFormat::DDM => CoordFormat::DD,
         }
+    }
+
+    fn prev(self) -> Self {
+        self.next().next()
     }
 }
 
@@ -119,14 +132,17 @@ pub enum SettingsField {
     Port,
     Units,
     CoordFormat,
+    /// The "[ Save ]" button: Enter applies like Ctrl+S.
+    Save,
 }
 
 impl SettingsField {
-    const ALL: &[SettingsField] = &[
+    pub const ALL: &[SettingsField] = &[
         SettingsField::Host,
         SettingsField::Port,
         SettingsField::Units,
         SettingsField::CoordFormat,
+        SettingsField::Save,
     ];
 
     fn next(self) -> Self {
@@ -141,11 +157,401 @@ impl SettingsField {
     }
 }
 
+/// Longest host name accepted by the settings dialog (DNS limit).
+const MAX_HOST_LEN: usize = 253;
+
+/// Validate a port typed into the settings dialog.
+pub fn validate_port(text: &str) -> Result<u16, String> {
+    if text.is_empty() {
+        return Err("Port is empty: enter 1-65535".to_string());
+    }
+    if !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Port must be digits only".to_string());
+    }
+    match text.parse::<u32>() {
+        Ok(p) if (1..=65535).contains(&p) => Ok(p as u16),
+        _ => Err(format!("Invalid port {}: must be 1-65535", text)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key bindings: one table drives dispatch, the help overlay and the status
+// bar hints, so they cannot drift apart.
+// ---------------------------------------------------------------------------
+
+/// What a key does. Some actions are resolved further by the key code
+/// (e.g. `ScrollLine` is Up or Down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    ToggleHelp,
+    JumpTab,
+    NextTab,
+    PrevTab,
+    Quit,
+    Reconnect,
+    OpenSettings,
+    CycleUnits,
+    OpenMaps,
+    ToggleLog,
+    ToggleHold,
+    CloseOverlay,
+    ScrollLine,
+    ScrollPage,
+    ScrollEnds,
+    NmeaPause,
+    NmeaFilter,
+    NmeaClear,
+    ToffArm,
+    ToffClear,
+    ClockSyncToggle,
+    DeviceSelect,
+    DeviceAdjust,
+    DeviceApply,
+    /// Documentation-only row (handled elsewhere, e.g. Ctrl+C).
+    Info,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBinding {
+    /// Key codes that trigger the action (empty for documentation rows).
+    pub keys: &'static [KeyCode],
+    /// How the key is shown in help and the status bar.
+    pub label: &'static str,
+    /// Description for the help overlay.
+    pub desc: &'static str,
+    /// Short status-bar hint, if the binding is shown there.
+    pub hint: Option<&'static str>,
+    pub action: Action,
+}
+
+const fn kb(
+    keys: &'static [KeyCode],
+    label: &'static str,
+    desc: &'static str,
+    hint: Option<&'static str>,
+    action: Action,
+) -> KeyBinding {
+    KeyBinding {
+        keys,
+        label,
+        desc,
+        hint,
+        action,
+    }
+}
+
+pub const GLOBAL_BINDINGS: &[KeyBinding] = &[
+    kb(
+        &[KeyCode::Char('?')],
+        "?",
+        "Toggle this help",
+        Some("help"),
+        Action::ToggleHelp,
+    ),
+    kb(
+        &[
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Char('3'),
+            KeyCode::Char('4'),
+            KeyCode::Char('5'),
+        ],
+        "1-5",
+        "Jump to tab N",
+        None,
+        Action::JumpTab,
+    ),
+    kb(&[KeyCode::Tab], "Tab", "Next tab", None, Action::NextTab),
+    kb(
+        &[KeyCode::BackTab],
+        "Shift+Tab",
+        "Previous tab",
+        None,
+        Action::PrevTab,
+    ),
+    kb(
+        &[KeyCode::Char('q')],
+        "q",
+        "Quit",
+        Some("quit"),
+        Action::Quit,
+    ),
+    kb(&[], "Ctrl+C", "Quit (works everywhere)", None, Action::Info),
+    kb(
+        &[KeyCode::Char('r')],
+        "r",
+        "Reconnect to gpsd",
+        Some("reconnect"),
+        Action::Reconnect,
+    ),
+    kb(
+        &[KeyCode::Char('s')],
+        "s",
+        "Settings (host/port/units)",
+        Some("settings"),
+        Action::OpenSettings,
+    ),
+    kb(
+        &[KeyCode::Char('u')],
+        "u",
+        "Cycle units (not saved)",
+        Some("units"),
+        Action::CycleUnits,
+    ),
+    kb(
+        &[KeyCode::Char('m')],
+        "m",
+        "Open position in Maps",
+        Some("maps"),
+        Action::OpenMaps,
+    ),
+    kb(
+        &[KeyCode::Char('l')],
+        "l",
+        "Start/stop GPX logging",
+        Some("log"),
+        Action::ToggleLog,
+    ),
+    kb(
+        &[KeyCode::Char('h')],
+        "h",
+        "Start/stop position hold",
+        Some("hold"),
+        Action::ToggleHold,
+    ),
+    kb(
+        &[KeyCode::Esc],
+        "Esc",
+        "Close overlay / dismiss",
+        None,
+        Action::CloseOverlay,
+    ),
+];
+
+const SCROLL_LINE: KeyBinding = kb(
+    &[KeyCode::Up, KeyCode::Down],
+    "\u{2191}/\u{2193}",
+    "Scroll one line",
+    Some("scroll"),
+    Action::ScrollLine,
+);
+const SCROLL_PAGE: KeyBinding = kb(
+    &[KeyCode::PageUp, KeyCode::PageDown],
+    "PgUp/PgDn",
+    "Scroll one page",
+    None,
+    Action::ScrollPage,
+);
+
+const SATELLITE_BINDINGS: &[KeyBinding] = &[
+    SCROLL_LINE,
+    SCROLL_PAGE,
+    kb(
+        &[KeyCode::Home, KeyCode::End],
+        "Home/End",
+        "First / last satellite",
+        None,
+        Action::ScrollEnds,
+    ),
+];
+
+const NMEA_BINDINGS: &[KeyBinding] = &[
+    kb(
+        &[KeyCode::Char('p')],
+        "p",
+        "Pause / resume the stream",
+        Some("pause"),
+        Action::NmeaPause,
+    ),
+    kb(
+        &[KeyCode::Char('f')],
+        "f",
+        "Cycle sentence filter",
+        Some("filter"),
+        Action::NmeaFilter,
+    ),
+    kb(
+        &[KeyCode::Char('c')],
+        "c",
+        "Clear buffer",
+        Some("clear"),
+        Action::NmeaClear,
+    ),
+    kb(
+        &[KeyCode::Up, KeyCode::Down],
+        "\u{2191}/\u{2193}",
+        "Scroll back / forward",
+        None,
+        Action::ScrollLine,
+    ),
+    SCROLL_PAGE,
+    kb(
+        &[KeyCode::Home, KeyCode::End],
+        "Home/End",
+        "Oldest / follow newest",
+        None,
+        Action::ScrollEnds,
+    ),
+];
+
+const TIMING_BINDINGS: &[KeyBinding] = &[
+    kb(
+        &[KeyCode::Char('a')],
+        "a",
+        "Arm one-shot TOFF capture",
+        Some("arm"),
+        Action::ToffArm,
+    ),
+    kb(
+        &[KeyCode::Char('c')],
+        "c",
+        "Clear TOFF data",
+        Some("clear"),
+        Action::ToffClear,
+    ),
+    kb(
+        &[KeyCode::Char('k')],
+        "k",
+        "Arm clock sync (next fix)",
+        Some("clock"),
+        Action::ClockSyncToggle,
+    ),
+];
+
+const DEVICE_BINDINGS: &[KeyBinding] = &[
+    kb(
+        &[KeyCode::Up, KeyCode::Down],
+        "\u{2191}/\u{2193}",
+        "Select control",
+        Some("select"),
+        Action::DeviceSelect,
+    ),
+    kb(
+        &[KeyCode::Left, KeyCode::Right],
+        "\u{2190}/\u{2192}",
+        "Change value (* = pending)",
+        Some("adjust"),
+        Action::DeviceAdjust,
+    ),
+    kb(
+        &[KeyCode::Enter],
+        "Enter",
+        "Apply (asks y/n first)",
+        Some("apply"),
+        Action::DeviceApply,
+    ),
+    kb(
+        &[],
+        "y/other",
+        "Confirm / cancel prompt",
+        None,
+        Action::Info,
+    ),
+];
+
+/// Keys shown in the settings dialog (dispatch is in the settings handler,
+/// which depends on whether a text field is being edited).
+pub const SETTINGS_BINDINGS: &[KeyBinding] = &[
+    kb(&[], "\u{2191}/\u{2193}", "move", None, Action::Info),
+    kb(&[], "Enter", "edit / cycle / save", None, Action::Info),
+    kb(&[], "\u{2190}/\u{2192}", "cycle value", None, Action::Info),
+    kb(&[], "Ctrl+S", "apply & save", None, Action::Info),
+    kb(
+        &[],
+        "Esc",
+        "cancel edit; again: discard & close",
+        None,
+        Action::Info,
+    ),
+];
+
+/// Tab-specific bindings for `tab`.
+pub fn tab_bindings(tab: ActiveTab) -> &'static [KeyBinding] {
+    match tab {
+        ActiveTab::Dashboard => &[],
+        ActiveTab::Satellites => SATELLITE_BINDINGS,
+        ActiveTab::Timing => TIMING_BINDINGS,
+        ActiveTab::Device => DEVICE_BINDINGS,
+        ActiveTab::Nmea => NMEA_BINDINGS,
+    }
+}
+
+/// Find the binding for `code` on `tab`. Global bindings take precedence;
+/// a unit test guarantees no tab binding collides with a global one.
+pub fn lookup_binding(tab: ActiveTab, code: KeyCode) -> Option<&'static KeyBinding> {
+    GLOBAL_BINDINGS
+        .iter()
+        .chain(tab_bindings(tab))
+        .find(|b| b.keys.contains(&code))
+}
+
+/// Scroll request, independent of which list is scrolled. `Up` moves
+/// towards the start of the list (older NMEA lines / first satellite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    Up(usize),
+    Down(usize),
+    Top,
+    Bottom,
+}
+
+/// Page size used before the first render has recorded the view height.
+const DEFAULT_PAGE: usize = 20;
+
+/// Maximum NMEA lines kept in the buffer (and in the pause buffer).
+pub const NMEA_BUFFER_MAX: usize = 1000;
+
 /// A side-effecting command queued by the Device tab and executed by the event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeviceCommand {
     Ubxtool(Vec<String>),
     BaudRate { speed: u32, device: String },
+}
+
+/// Control values of the Device tab. Indices refer to the option tables
+/// below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceValues {
+    pub nav_rate_idx: usize,
+    pub power_mode_idx: usize,
+    pub serial_speed_idx: usize,
+    pub pps_frequency_idx: usize,
+    pub gnss_enabled: [bool; 6],
+}
+
+impl Default for DeviceValues {
+    /// tuigps defaults. The receiver's actual configuration is not read
+    /// back, so these are assumptions until a value is applied.
+    fn default() -> Self {
+        Self {
+            nav_rate_idx: 0,
+            power_mode_idx: 0,
+            serial_speed_idx: 1, // 9600
+            pps_frequency_idx: 0,
+            gnss_enabled: [true; 6],
+        }
+    }
+}
+
+/// A Device-tab change awaiting `y` confirmation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceConfirm {
+    pub control: usize,
+    /// One-line question, e.g. "Apply nav rate 5 Hz?".
+    pub prompt: String,
+    /// Extra warning for destructive changes (serial speed, disabling a
+    /// constellation, save to flash). `Some` means destructive.
+    pub warning: Option<String>,
+    /// Line appended to the output log when confirmed.
+    pub log: String,
+    /// Commands queued when confirmed.
+    pub commands: Vec<DeviceCommand>,
+}
+
+impl DeviceConfirm {
+    pub fn destructive(&self) -> bool {
+        self.warning.is_some()
+    }
 }
 
 // Device configuration state
@@ -158,6 +564,13 @@ pub struct DeviceConfigState {
     pub output_log: Vec<String>,
     pub selected_control: usize,
     pub proto_version: String,
+    /// Values last applied (sent) per control; initially the assumed
+    /// defaults. A control whose value differs is shown as pending.
+    pub applied: DeviceValues,
+    /// Controls applied at least once this session.
+    pub sent: [bool; DEVICE_CONTROL_COUNT],
+    /// Change waiting for confirmation.
+    pub confirm: Option<DeviceConfirm>,
 }
 
 pub const NAV_RATES: &[(&str, u32)] =
@@ -191,15 +604,59 @@ impl Default for DeviceConfigState {
 
 impl DeviceConfigState {
     pub fn new() -> Self {
+        let v = DeviceValues::default();
         Self {
-            nav_rate_idx: 0,
-            power_mode_idx: 0,
-            serial_speed_idx: 1, // 9600
-            pps_frequency_idx: 0,
-            gnss_enabled: [true; 6],
+            nav_rate_idx: v.nav_rate_idx,
+            power_mode_idx: v.power_mode_idx,
+            serial_speed_idx: v.serial_speed_idx,
+            pps_frequency_idx: v.pps_frequency_idx,
+            gnss_enabled: v.gnss_enabled,
             output_log: Vec::new(),
             selected_control: 0,
             proto_version: "18".to_string(),
+            applied: v,
+            sent: [false; DEVICE_CONTROL_COUNT],
+            confirm: None,
+        }
+    }
+
+    /// The values currently shown in the controls.
+    pub fn current(&self) -> DeviceValues {
+        DeviceValues {
+            nav_rate_idx: self.nav_rate_idx,
+            power_mode_idx: self.power_mode_idx,
+            serial_speed_idx: self.serial_speed_idx,
+            pps_frequency_idx: self.pps_frequency_idx,
+            gnss_enabled: self.gnss_enabled,
+        }
+    }
+
+    /// Whether `control` has been changed but not applied.
+    pub fn is_pending(&self, control: usize) -> bool {
+        let (c, a) = (self.current(), self.applied);
+        match control {
+            0 => c.nav_rate_idx != a.nav_rate_idx,
+            1 => c.power_mode_idx != a.power_mode_idx,
+            2 => c.serial_speed_idx != a.serial_speed_idx,
+            3 => c.pps_frequency_idx != a.pps_frequency_idx,
+            4..=9 => c.gnss_enabled[control - 4] != a.gnss_enabled[control - 4],
+            _ => false,
+        }
+    }
+
+    /// Record `control`'s current value as applied.
+    fn mark_applied(&mut self, control: usize) {
+        let c = self.current();
+        match control {
+            0 => self.applied.nav_rate_idx = c.nav_rate_idx,
+            1 => self.applied.power_mode_idx = c.power_mode_idx,
+            2 => self.applied.serial_speed_idx = c.serial_speed_idx,
+            3 => self.applied.pps_frequency_idx = c.pps_frequency_idx,
+            4..=9 => self.applied.gnss_enabled[control - 4] = c.gnss_enabled[control - 4],
+            _ => {}
+        }
+        if let Some(s) = self.sent.get_mut(control) {
+            *s = true;
         }
     }
 
@@ -220,6 +677,7 @@ pub struct App {
     pub coord_format: CoordFormat,
     pub should_quit: bool,
     pub show_settings: bool,
+    pub show_help: bool,
 
     // Subsystems
     pub logger: Option<GpsLogger>,
@@ -232,6 +690,12 @@ pub struct App {
     pub settings_field: SettingsField,
     pub settings_editing: bool,
     pub settings_edit_buf: String,
+    /// Validation error shown inside the settings dialog.
+    pub settings_message: String,
+    /// Values when the dialog was opened; restored on Esc.
+    pub settings_snapshot: Option<Config>,
+    /// Where settings are saved on apply (`None`: not persisted).
+    pub config_path: Option<PathBuf>,
 
     // NMEA state
     pub nmea_buffer: VecDeque<String>,
@@ -239,10 +703,15 @@ pub struct App {
     pub nmea_pause_buffer: VecDeque<String>,
     pub nmea_filter: String,
     pub nmea_filter_idx: usize,
+    /// Lines scrolled back from the newest; 0 = following new sentences.
     pub nmea_scroll_offset: usize,
+    /// NMEA lines visible in the last render (0 = not rendered yet).
+    pub nmea_view_rows: Cell<usize>,
 
     // Satellite table scroll
     pub sat_scroll_offset: usize,
+    /// Satellite rows visible in the last render (0 = not rendered yet).
+    pub sat_view_rows: Cell<usize>,
 
     // Device config state
     pub device_config: DeviceConfigState,
@@ -289,6 +758,7 @@ impl App {
             coord_format: CoordFormat::DD,
             should_quit: false,
             show_settings: false,
+            show_help: false,
             logger: None,
             log_dir: PathBuf::from("."),
             position_hold: None,
@@ -297,13 +767,18 @@ impl App {
             settings_field: SettingsField::Host,
             settings_editing: false,
             settings_edit_buf: String::new(),
-            nmea_buffer: VecDeque::with_capacity(1000),
+            settings_message: String::new(),
+            settings_snapshot: None,
+            config_path: None,
+            nmea_buffer: VecDeque::with_capacity(NMEA_BUFFER_MAX),
             nmea_paused: false,
-            nmea_pause_buffer: VecDeque::with_capacity(1000),
+            nmea_pause_buffer: VecDeque::with_capacity(NMEA_BUFFER_MAX),
             nmea_filter: String::new(),
             nmea_filter_idx: 0,
             nmea_scroll_offset: 0,
+            nmea_view_rows: Cell::new(0),
             sat_scroll_offset: 0,
+            sat_view_rows: Cell::new(0),
             device_config: DeviceConfigState::new(),
             pending_device_cmds: Vec::new(),
             armed_clock_set: false,
@@ -327,42 +802,156 @@ impl App {
         self.status_message_tick = 5; // show for 5 ticks (seconds)
     }
 
+    /// Build the app from startup settings (config file + CLI overrides).
+    pub fn from_startup(startup: Startup) -> Self {
+        let Startup {
+            config,
+            config_path,
+            message,
+        } = startup;
+        let mut app = App::new(config.host, config.port);
+        app.units = config.units;
+        app.coord_format = config.coord_format;
+        app.config_path = config_path;
+        if let Some(msg) = message {
+            app.set_status(msg);
+        }
+        app
+    }
+
+    /// The persistable settings currently in effect.
+    pub fn current_config(&self) -> Config {
+        Config {
+            host: self.host.clone(),
+            port: self.port,
+            units: self.units,
+            coord_format: self.coord_format,
+        }
+    }
+
+    /// Key handling precedence: Ctrl+C, settings dialog, help overlay,
+    /// pending device confirmation, then the key binding table.
     pub fn handle_event(&mut self, event: Event) {
-        // Ctrl+C always quits, regardless of tab or overlay.
-        if let Event::Key(key) = &event
-            && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        let Event::Key(key) = event else {
+            return;
+        };
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+
+        // Ctrl+C always quits, regardless of tab, overlay or prompt.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
         }
 
         if self.show_settings {
-            self.handle_settings_input(event);
+            self.handle_settings_key(key);
             return;
         }
 
-        if let Event::Key(key) = event {
-            if key.kind != KeyEventKind::Press {
-                return;
+        if self.show_help {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            ) {
+                self.show_help = false;
             }
-            match key.code {
-                KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('r') => self.reconnect_requested = true,
-                KeyCode::Char('s') => {
-                    self.show_settings = true;
-                    self.settings_editing = false;
-                    self.settings_field = SettingsField::Host;
+            return;
+        }
+
+        if self.device_config.confirm.is_some() {
+            self.handle_device_confirm(key);
+            return;
+        }
+
+        // Ctrl/Alt chords are not bound (Ctrl+C is handled above).
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+
+        if let Some(binding) = lookup_binding(self.active_tab, key.code) {
+            self.run_action(binding.action, key.code);
+        }
+    }
+
+    fn run_action(&mut self, action: Action, code: KeyCode) {
+        match action {
+            Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::JumpTab => {
+                if let KeyCode::Char(c @ '1'..='9') = code
+                    && let Some(tab) = ActiveTab::ALL.get(c as usize - '1' as usize)
+                {
+                    self.active_tab = *tab;
                 }
-                KeyCode::Char('u') => self.cycle_units(),
-                KeyCode::Char('m') => self.open_maps(),
-                KeyCode::Char('l') => self.toggle_logging(),
-                KeyCode::Char('h') => self.toggle_hold(),
-                KeyCode::Tab => self.next_tab(),
-                KeyCode::BackTab => self.prev_tab(),
-                _ => self.handle_tab_input(key),
             }
+            Action::NextTab => self.next_tab(),
+            Action::PrevTab => self.prev_tab(),
+            Action::Quit => self.should_quit = true,
+            Action::Reconnect => self.reconnect_requested = true,
+            Action::OpenSettings => self.open_settings(),
+            Action::CycleUnits => self.cycle_units(),
+            Action::OpenMaps => self.open_maps(),
+            Action::ToggleLog => self.toggle_logging(),
+            Action::ToggleHold => self.toggle_hold(),
+            Action::CloseOverlay => {
+                // Nothing open: Esc just dismisses the status message.
+                self.status_message.clear();
+                self.status_message_tick = 0;
+            }
+            Action::ScrollLine | Action::ScrollPage | Action::ScrollEnds => {
+                let scroll = match code {
+                    KeyCode::Up => Scroll::Up(1),
+                    KeyCode::Down => Scroll::Down(1),
+                    KeyCode::PageUp => Scroll::Up(self.page_size()),
+                    KeyCode::PageDown => Scroll::Down(self.page_size()),
+                    KeyCode::Home => Scroll::Top,
+                    _ => Scroll::Bottom,
+                };
+                match self.active_tab {
+                    ActiveTab::Nmea => self.scroll_nmea(scroll),
+                    ActiveTab::Satellites => self.scroll_satellites(scroll),
+                    _ => {}
+                }
+            }
+            Action::NmeaPause => self.toggle_nmea_pause(),
+            Action::NmeaFilter => self.cycle_nmea_filter(),
+            Action::NmeaClear => {
+                self.nmea_buffer.clear();
+                self.nmea_pause_buffer.clear();
+                self.nmea_scroll_offset = 0;
+                self.set_status("NMEA buffer cleared");
+            }
+            Action::ToffArm => {
+                self.armed_toff = true;
+                self.set_status("TOFF armed — waiting for next fix...");
+            }
+            Action::ToffClear => self.clear_toff(),
+            Action::ClockSyncToggle => {
+                if self.armed_clock_set {
+                    self.armed_clock_set = false;
+                    self.set_status("Clock sync disarmed");
+                } else {
+                    self.armed_clock_set = true;
+                    self.set_status("Clock sync ARMED — will fire on next 2D/3D fix");
+                }
+            }
+            Action::DeviceSelect => {
+                let dc = &mut self.device_config;
+                if code == KeyCode::Up {
+                    dc.selected_control = dc.selected_control.saturating_sub(1);
+                } else if dc.selected_control < DEVICE_CONTROL_COUNT - 1 {
+                    dc.selected_control += 1;
+                }
+            }
+            Action::DeviceAdjust => {
+                self.device_config_adjust(if code == KeyCode::Left { -1 } else { 1 })
+            }
+            Action::DeviceApply => self.device_config_activate(),
+            Action::Info => {}
         }
     }
 
@@ -411,15 +1000,12 @@ impl App {
             }
             GpsdEvent::Nmea(sentence) => {
                 if self.nmea_paused {
-                    if self.nmea_pause_buffer.len() >= 1000 {
+                    if self.nmea_pause_buffer.len() >= NMEA_BUFFER_MAX {
                         self.nmea_pause_buffer.pop_front();
                     }
                     self.nmea_pause_buffer.push_back(sentence);
                 } else {
-                    if self.nmea_buffer.len() >= 1000 {
-                        self.nmea_buffer.pop_front();
-                    }
-                    self.nmea_buffer.push_back(sentence);
+                    self.push_nmea(sentence);
                 }
             }
         }
@@ -626,205 +1212,322 @@ impl App {
         }
     }
 
-    fn handle_settings_input(&mut self, event: Event) {
-        if let Event::Key(key) = event {
-            if key.kind != KeyEventKind::Press {
-                return;
-            }
+    // ------------------------------------------------------------------
+    // Settings dialog
+    //
+    // Opening snapshots the current values. Units/coords preview live.
+    // Esc while editing a text field cancels that field; Esc otherwise
+    // discards every change and closes. Ctrl+S (or Enter on [Save])
+    // applies: saves the config file and reconnects if host/port changed.
+    // ------------------------------------------------------------------
 
-            if self.settings_editing {
-                // Text input mode
-                match key.code {
-                    KeyCode::Esc => {
-                        self.settings_editing = false;
-                    }
-                    KeyCode::Enter => {
-                        // Apply the edit
-                        match self.settings_field {
-                            SettingsField::Host => {
-                                if !self.settings_edit_buf.is_empty() {
-                                    self.host = self.settings_edit_buf.clone();
-                                }
-                            }
-                            SettingsField::Port => {
-                                if let Ok(p) = self.settings_edit_buf.parse::<u16>() {
-                                    self.port = p;
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.settings_editing = false;
-                    }
-                    KeyCode::Backspace => {
-                        self.settings_edit_buf.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        self.settings_edit_buf.push(c);
-                    }
-                    _ => {}
-                }
-                return;
-            }
+    pub fn open_settings(&mut self) {
+        self.show_settings = true;
+        self.settings_editing = false;
+        self.settings_field = SettingsField::Host;
+        self.settings_message.clear();
+        self.settings_snapshot = Some(self.current_config());
+    }
 
-            // Navigation mode
-            match key.code {
-                KeyCode::Esc => self.show_settings = false,
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Apply and close
-                    self.reconnect_requested = true;
-                    self.show_settings = false;
+    /// Discard all changes made in the dialog and close it.
+    pub fn cancel_settings(&mut self) {
+        if let Some(old) = self.settings_snapshot.take() {
+            let changed = old != self.current_config();
+            self.host = old.host;
+            self.port = old.port;
+            self.units = old.units;
+            self.coord_format = old.coord_format;
+            if changed {
+                self.set_status("Settings changes discarded");
+            }
+        }
+        self.close_settings();
+    }
+
+    /// Apply the dialog's values: persist them and reconnect if the gpsd
+    /// address changed.
+    pub fn apply_settings(&mut self) {
+        let old = self
+            .settings_snapshot
+            .take()
+            .unwrap_or_else(|| self.current_config());
+        self.close_settings();
+
+        let new = self.current_config();
+        let mut msg = Vec::new();
+        if old.host != new.host || old.port != new.port {
+            self.reconnect_requested = true;
+            msg.push(format!("Reconnecting to {}:{}", new.host, new.port));
+        } else {
+            msg.push("Settings applied".to_string());
+        }
+        if let Some(path) = &self.config_path {
+            match config::save(path, &new) {
+                Ok(()) => msg.push(format!("saved to {}", path.display())),
+                Err(e) => msg.push(format!("NOT saved ({}: {})", path.display(), e)),
+            }
+        }
+        self.set_status(msg.join("; "));
+    }
+
+    fn close_settings(&mut self) {
+        self.show_settings = false;
+        self.settings_editing = false;
+        self.settings_message.clear();
+    }
+
+    /// Validate and store the text field being edited. On error the
+    /// message is shown in the dialog and editing continues.
+    fn commit_settings_edit(&mut self) -> bool {
+        let result = match self.settings_field {
+            SettingsField::Host => {
+                let host = self.settings_edit_buf.trim();
+                if host.is_empty() {
+                    Err("Host must not be empty".to_string())
+                } else {
+                    self.host = host.to_string();
+                    Ok(())
                 }
-                KeyCode::Up | KeyCode::BackTab => {
-                    self.settings_field = self.settings_field.prev();
-                }
-                KeyCode::Down | KeyCode::Tab => {
-                    self.settings_field = self.settings_field.next();
-                }
-                KeyCode::Enter => match self.settings_field {
-                    SettingsField::Host => {
-                        self.settings_editing = true;
-                        self.settings_edit_buf = self.host.clone();
-                    }
-                    SettingsField::Port => {
-                        self.settings_editing = true;
-                        self.settings_edit_buf = self.port.to_string();
-                    }
-                    SettingsField::Units => {
-                        self.units = self.units.next();
-                    }
-                    SettingsField::CoordFormat => {
-                        self.coord_format = self.coord_format.next();
-                    }
-                },
-                KeyCode::Left | KeyCode::Right => {
-                    // Cycle values for Units/CoordFormat
-                    match self.settings_field {
-                        SettingsField::Units => self.units = self.units.next(),
-                        SettingsField::CoordFormat => self.coord_format = self.coord_format.next(),
-                        _ => {}
-                    }
-                }
-                _ => {}
+            }
+            SettingsField::Port => validate_port(&self.settings_edit_buf).map(|p| self.port = p),
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.settings_editing = false;
+                self.settings_message.clear();
+                true
+            }
+            Err(e) => {
+                self.settings_message = e;
+                false
             }
         }
     }
 
-    fn handle_tab_input(&mut self, key: crossterm::event::KeyEvent) {
-        match self.active_tab {
-            ActiveTab::Nmea => match key.code {
-                KeyCode::Char('p') => {
-                    if self.nmea_paused {
-                        // Unpause: merge pause buffer into main buffer
-                        while let Some(s) = self.nmea_pause_buffer.pop_front() {
-                            if self.nmea_buffer.len() >= 1000 {
-                                self.nmea_buffer.pop_front();
-                            }
-                            self.nmea_buffer.push_back(s);
-                        }
-                    }
-                    self.nmea_paused = !self.nmea_paused;
-                    self.nmea_scroll_offset = 0;
+    fn handle_settings_key(&mut self, key: crossterm::event::KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('s') {
+            if !self.settings_editing || self.commit_settings_edit() {
+                self.apply_settings();
+            }
+            return;
+        }
+
+        if self.settings_editing {
+            self.handle_settings_text_key(key);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.cancel_settings(),
+            KeyCode::Up | KeyCode::BackTab => self.settings_field = self.settings_field.prev(),
+            KeyCode::Down | KeyCode::Tab => self.settings_field = self.settings_field.next(),
+            KeyCode::Enter => match self.settings_field {
+                SettingsField::Host => {
+                    self.settings_editing = true;
+                    self.settings_edit_buf = self.host.clone();
                 }
-                KeyCode::Char('c') => {
-                    self.nmea_buffer.clear();
-                    self.nmea_pause_buffer.clear();
-                    self.nmea_scroll_offset = 0;
-                    self.set_status("NMEA buffer cleared");
+                SettingsField::Port => {
+                    self.settings_editing = true;
+                    self.settings_edit_buf = self.port.to_string();
                 }
-                KeyCode::Char('f') => {
-                    self.nmea_filter_idx = (self.nmea_filter_idx + 1) % NMEA_FILTERS.len();
-                    self.nmea_filter = NMEA_FILTERS[self.nmea_filter_idx].to_string();
-                    self.nmea_scroll_offset = 0;
-                    let label = if self.nmea_filter.is_empty() {
-                        "ALL"
-                    } else {
-                        &self.nmea_filter
-                    };
-                    self.set_status(format!("Filter: {}", label));
-                }
-                KeyCode::Up => {
-                    self.nmea_scroll_offset = self.nmea_scroll_offset.saturating_add(1);
-                }
-                KeyCode::Down => {
-                    self.nmea_scroll_offset = self.nmea_scroll_offset.saturating_sub(1);
-                }
-                KeyCode::PageUp => {
-                    self.nmea_scroll_offset = self.nmea_scroll_offset.saturating_add(20);
-                }
-                KeyCode::PageDown => {
-                    self.nmea_scroll_offset = self.nmea_scroll_offset.saturating_sub(20);
-                }
+                SettingsField::Units => self.units = self.units.next(),
+                SettingsField::CoordFormat => self.coord_format = self.coord_format.next(),
+                SettingsField::Save => self.apply_settings(),
+            },
+            KeyCode::Left => match self.settings_field {
+                SettingsField::Units => self.units = self.units.prev(),
+                SettingsField::CoordFormat => self.coord_format = self.coord_format.prev(),
                 _ => {}
             },
-            ActiveTab::Timing => match key.code {
-                KeyCode::Char('a') => {
-                    self.armed_toff = true;
-                    self.set_status("TOFF armed — waiting for next fix...");
-                }
-                KeyCode::Char('c') => {
-                    let had_data = !self.gps_data.toff_samples.is_empty()
-                        || self.gps_data.toff_armed_offset.is_finite();
-                    self.gps_data.toff_samples.clear();
-                    self.gps_data.toff_armed_offset = f64::NAN;
-                    self.gps_data.toff_armed_gps_time.clear();
-                    self.gps_data.toff_armed_sys_time = f64::NAN;
-                    self.armed_toff = false;
-                    if had_data {
-                        self.set_status("TOFF data cleared");
-                    } else {
-                        self.set_status("TOFF data already empty");
-                    }
-                }
-                KeyCode::Char('k') => {
-                    // Toggle armed clock sync
-                    if self.armed_clock_set {
-                        self.armed_clock_set = false;
-                        self.set_status("Clock sync disarmed");
-                    } else {
-                        self.armed_clock_set = true;
-                        self.set_status("Clock sync ARMED — will fire on next 2D/3D fix");
-                    }
-                }
-                _ => {}
-            },
-            ActiveTab::Satellites => match key.code {
-                KeyCode::Up => {
-                    self.sat_scroll_offset = self.sat_scroll_offset.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    self.sat_scroll_offset = self.sat_scroll_offset.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.sat_scroll_offset = self.sat_scroll_offset.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.sat_scroll_offset = self.sat_scroll_offset.saturating_add(20);
-                }
-                _ => {}
-            },
-            ActiveTab::Device => match key.code {
-                KeyCode::Up => {
-                    if self.device_config.selected_control > 0 {
-                        self.device_config.selected_control -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if self.device_config.selected_control < DEVICE_CONTROL_COUNT - 1 {
-                        self.device_config.selected_control += 1;
-                    }
-                }
-                KeyCode::Left => {
-                    self.device_config_adjust(-1);
-                }
-                KeyCode::Right => {
-                    self.device_config_adjust(1);
-                }
-                KeyCode::Enter => {
-                    self.device_config_activate();
-                }
+            KeyCode::Right => match self.settings_field {
+                SettingsField::Units => self.units = self.units.next(),
+                SettingsField::CoordFormat => self.coord_format = self.coord_format.next(),
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    fn handle_settings_text_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.settings_editing = false;
+                self.settings_message.clear();
+            }
+            KeyCode::Enter => {
+                self.commit_settings_edit();
+            }
+            KeyCode::Backspace => {
+                self.settings_edit_buf.pop();
+                self.settings_message.clear();
+            }
+            KeyCode::Char(_)
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {}
+            KeyCode::Char(c) => match self.settings_field {
+                SettingsField::Port => {
+                    if !c.is_ascii_digit() {
+                        self.settings_message = format!("Port accepts digits only ('{}')", c);
+                    } else if self.settings_edit_buf.len() >= 5 {
+                        self.settings_message = "Port is at most 5 digits (1-65535)".to_string();
+                    } else {
+                        self.settings_edit_buf.push(c);
+                        self.settings_message = match validate_port(&self.settings_edit_buf) {
+                            Ok(_) => String::new(),
+                            Err(e) => e,
+                        };
+                    }
+                }
+                _ => {
+                    if c.is_whitespace() || c.is_control() {
+                        self.settings_message = "Host cannot contain spaces".to_string();
+                    } else if self.settings_edit_buf.len() >= MAX_HOST_LEN {
+                        self.settings_message = "Host name too long".to_string();
+                    } else {
+                        self.settings_edit_buf.push(c);
+                        self.settings_message.clear();
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Scrolling
+    // ------------------------------------------------------------------
+
+    fn page_size(&self) -> usize {
+        let rows = match self.active_tab {
+            ActiveTab::Nmea => self.nmea_view_rows.get(),
+            _ => self.sat_view_rows.get(),
+        };
+        if rows == 0 {
+            DEFAULT_PAGE
+        } else {
+            rows.saturating_sub(1).max(1)
+        }
+    }
+
+    fn nmea_matches(&self, sentence: &str) -> bool {
+        self.nmea_filter.is_empty()
+            || crate::ui::nmea_viewer::nmea_type(sentence) == self.nmea_filter
+    }
+
+    /// Number of buffered NMEA lines passing the current filter.
+    pub fn nmea_visible_count(&self) -> usize {
+        if self.nmea_filter.is_empty() {
+            self.nmea_buffer.len()
+        } else {
+            self.nmea_buffer
+                .iter()
+                .filter(|s| self.nmea_matches(s))
+                .count()
+        }
+    }
+
+    /// Largest useful NMEA scroll offset (top of the buffer in view).
+    pub fn nmea_max_scroll(&self) -> usize {
+        self.nmea_visible_count()
+            .saturating_sub(self.nmea_view_rows.get())
+    }
+
+    /// Largest useful satellite-table offset (last row at the bottom).
+    pub fn sat_max_scroll(&self) -> usize {
+        self.gps_data
+            .satellites
+            .len()
+            .saturating_sub(self.sat_view_rows.get())
+    }
+
+    /// True while the NMEA view shows the newest lines as they arrive.
+    pub fn nmea_following(&self) -> bool {
+        !self.nmea_paused && self.nmea_scroll_offset == 0
+    }
+
+    pub fn scroll_nmea(&mut self, scroll: Scroll) {
+        let max = self.nmea_max_scroll();
+        // Start from the effective (clamped) offset so overshoot from
+        // earlier never needs undoing.
+        let cur = self.nmea_scroll_offset.min(max);
+        self.nmea_scroll_offset = match scroll {
+            Scroll::Up(n) => cur.saturating_add(n).min(max),
+            Scroll::Down(n) => cur.saturating_sub(n),
+            Scroll::Top => max,
+            Scroll::Bottom => 0,
+        };
+    }
+
+    pub fn scroll_satellites(&mut self, scroll: Scroll) {
+        let max = self.sat_max_scroll();
+        let cur = self.sat_scroll_offset.min(max);
+        self.sat_scroll_offset = match scroll {
+            Scroll::Up(n) => cur.saturating_sub(n),
+            Scroll::Down(n) => cur.saturating_add(n).min(max),
+            Scroll::Top => 0,
+            Scroll::Bottom => max,
+        };
+    }
+
+    /// Append a sentence to the live NMEA buffer. While scrolled back, the
+    /// bottom-relative offset grows with each visible line so the view
+    /// stays on the same sentences.
+    pub fn push_nmea(&mut self, sentence: String) {
+        if self.nmea_buffer.len() >= NMEA_BUFFER_MAX {
+            self.nmea_buffer.pop_front();
+        }
+        let visible = self.nmea_matches(&sentence);
+        self.nmea_buffer.push_back(sentence);
+        if self.nmea_scroll_offset > 0 {
+            if visible {
+                self.nmea_scroll_offset += 1;
+            }
+            // Lines evicted from the front can push the anchor off the top.
+            self.nmea_scroll_offset = self.nmea_scroll_offset.min(self.nmea_max_scroll());
+        }
+    }
+
+    fn toggle_nmea_pause(&mut self) {
+        if self.nmea_paused {
+            // Unpause: merge pause buffer into main buffer
+            while let Some(s) = self.nmea_pause_buffer.pop_front() {
+                if self.nmea_buffer.len() >= NMEA_BUFFER_MAX {
+                    self.nmea_buffer.pop_front();
+                }
+                self.nmea_buffer.push_back(s);
+            }
+        }
+        self.nmea_paused = !self.nmea_paused;
+        self.nmea_scroll_offset = 0;
+    }
+
+    fn cycle_nmea_filter(&mut self) {
+        self.nmea_filter_idx = (self.nmea_filter_idx + 1) % NMEA_FILTERS.len();
+        self.nmea_filter = NMEA_FILTERS[self.nmea_filter_idx].to_string();
+        self.nmea_scroll_offset = 0;
+        let label = if self.nmea_filter.is_empty() {
+            "ALL"
+        } else {
+            &self.nmea_filter
+        };
+        self.set_status(format!("Filter: {}", label));
+    }
+
+    fn clear_toff(&mut self) {
+        let had_data =
+            !self.gps_data.toff_samples.is_empty() || self.gps_data.toff_armed_offset.is_finite();
+        self.gps_data.toff_samples.clear();
+        self.gps_data.toff_armed_offset = f64::NAN;
+        self.gps_data.toff_armed_gps_time.clear();
+        self.gps_data.toff_armed_sys_time = f64::NAN;
+        self.armed_toff = false;
+        if had_data {
+            self.set_status("TOFF data cleared");
+        } else {
+            self.set_status("TOFF data already empty");
         }
     }
 
@@ -862,60 +1565,129 @@ impl App {
         }
     }
 
+    /// Enter on a Device control: build the change and ask for
+    /// confirmation. Nothing is queued until `y`.
     fn device_config_activate(&mut self) {
-        let dc = &mut self.device_config;
-        match dc.selected_control {
+        let confirm = self.build_device_confirm();
+        let prefix = if confirm.destructive() {
+            "WARNING: "
+        } else {
+            ""
+        };
+        self.set_status(format!("{}{} y/n", prefix, confirm.prompt));
+        self.device_config.confirm = Some(confirm);
+    }
+
+    fn build_device_confirm(&self) -> DeviceConfirm {
+        let dc = &self.device_config;
+        let control = dc.selected_control;
+        let ubx =
+            |args: &[&str]| DeviceCommand::Ubxtool(args.iter().map(|s| s.to_string()).collect());
+        let (prompt, warning, log, commands) = match control {
             0 => {
-                // Nav rate
                 let (name, ms) = NAV_RATES[dc.nav_rate_idx];
-                dc.push_log(format!("Setting nav rate: {} ({}ms)...", name, ms));
-                self.queue_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)]);
+                (
+                    format!("Apply nav rate {}?", name),
+                    None,
+                    format!("Setting nav rate: {} ({}ms)...", name, ms),
+                    vec![ubx(&["-p", &format!("CFG-RATE,{}", ms)])],
+                )
             }
             1 => {
-                // Power mode
                 let (name, mode) = POWER_MODES[dc.power_mode_idx];
-                dc.push_log(format!("Setting power mode: {}...", name));
-                self.queue_ubxtool(&["-p", &format!("PMS,{}", mode)]);
+                (
+                    format!("Apply power mode {}?", name),
+                    None,
+                    format!("Setting power mode: {}...", name),
+                    vec![ubx(&["-p", &format!("PMS,{}", mode)])],
+                )
             }
             2 => {
                 // Serial speed (two-step: ubxtool then gpsctl)
                 let speed = SERIAL_SPEEDS[dc.serial_speed_idx];
                 let device = self.gps_data.device.path.clone();
-                dc.push_log(format!("Setting baud rate to {}...", speed));
-                self.pending_device_cmds
-                    .push(DeviceCommand::BaudRate { speed, device });
+                (
+                    format!("Change serial speed to {} baud?", speed),
+                    Some(
+                        "The link to the receiver can be lost if gpsd or the port does not \
+                         follow the new speed."
+                            .to_string(),
+                    ),
+                    format!("Setting baud rate to {}...", speed),
+                    vec![DeviceCommand::BaudRate { speed, device }],
+                )
             }
             3 => {
-                // PPS frequency
                 let (name, freq) = PPS_FREQUENCIES[dc.pps_frequency_idx];
-                dc.push_log(format!("Setting PPS: {}...", name));
                 let cmd = build_tp5_cmd(freq, 100000, true);
-                self.queue_ubxtool(&["-c", &cmd]);
+                (
+                    format!("Apply PPS frequency {}?", name),
+                    None,
+                    format!("Setting PPS: {}...", name),
+                    vec![ubx(&["-c", &cmd])],
+                )
             }
             4..=9 => {
-                // GNSS toggles
-                let idx = dc.selected_control - 4;
+                let idx = control - 4;
                 let name = GNSS_NAMES_CONFIG[idx];
                 let ubx_name = GNSS_UBXTOOL_NAMES[idx];
-                let enabled = dc.gnss_enabled[idx];
-                let flag = if enabled { "-e" } else { "-d" };
-                let state = if enabled { "Enabling" } else { "Disabling" };
-                dc.push_log(format!("{} {}...", state, name));
-                self.queue_ubxtool(&[flag, ubx_name]);
+                if dc.gnss_enabled[idx] {
+                    (
+                        format!("Enable {}?", name),
+                        None,
+                        format!("Enabling {}...", name),
+                        vec![ubx(&["-e", ubx_name])],
+                    )
+                } else {
+                    (
+                        format!("DISABLE {}?", name),
+                        Some(format!(
+                            "The receiver stops tracking {} satellites; the fix may degrade \
+                             or be lost.",
+                            name
+                        )),
+                        format!("Disabling {}...", name),
+                        vec![ubx(&["-d", ubx_name])],
+                    )
+                }
             }
-            10 => {
-                // Save config
-                dc.push_log("Saving config to flash...".to_string());
-                self.queue_ubxtool(&["-p", "SAVE"]);
-            }
-            _ => {}
+            _ => (
+                "Save receiver config to flash?".to_string(),
+                Some(
+                    "Overwrites the stored configuration; it persists across power cycles."
+                        .to_string(),
+                ),
+                "Saving config to flash...".to_string(),
+                vec![ubx(&["-p", "SAVE"])],
+            ),
+        };
+        DeviceConfirm {
+            control,
+            prompt,
+            warning,
+            log,
+            commands,
         }
     }
 
-    fn queue_ubxtool(&mut self, args: &[&str]) {
-        self.pending_device_cmds.push(DeviceCommand::Ubxtool(
-            args.iter().map(|s| s.to_string()).collect(),
-        ));
+    /// Answer to a pending Device confirmation: `y` applies, any other key
+    /// cancels.
+    fn handle_device_confirm(&mut self, key: crossterm::event::KeyEvent) {
+        let Some(confirm) = self.device_config.confirm.take() else {
+            return;
+        };
+        let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if yes {
+            self.device_config.push_log(confirm.log);
+            self.device_config.mark_applied(confirm.control);
+            self.pending_device_cmds.extend(confirm.commands);
+            self.set_status("Device command sent; see Output");
+        } else {
+            self.set_status(format!("Cancelled: {}", confirm.prompt));
+        }
     }
 
     /// Execute queued device commands. Kept separate from key handling so
@@ -1157,8 +1929,10 @@ impl FrameLimiter {
     }
 }
 
-pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
-    let mut app = App::new(host.to_string(), port);
+/// Run the TUI until quit. `startup` comes from [`config::startup`]
+/// (config file merged with CLI overrides).
+pub async fn run(terminal: &mut Terminal<impl Backend>, startup: Startup) -> Result<()> {
+    let mut app = App::from_startup(startup);
     let result = event_loop(terminal, &mut app).await;
     // Always close the log so the GPX file is valid, even on error.
     app.stop_logging();
@@ -1451,10 +2225,13 @@ mod tests {
         assert_eq!(app.settings_field, SettingsField::CoordFormat);
 
         app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::Save);
+
+        app.handle_event(key_event(KeyCode::Down));
         assert_eq!(app.settings_field, SettingsField::Host); // wraps
 
         app.handle_event(key_event(KeyCode::Up));
-        assert_eq!(app.settings_field, SettingsField::CoordFormat); // wraps back
+        assert_eq!(app.settings_field, SettingsField::Save); // wraps back
     }
 
     #[test]
@@ -1528,9 +2305,264 @@ mod tests {
         app.handle_event(key_event(KeyCode::Char('s'))); // open
         assert!(app.show_settings);
 
+        // Nothing changed: apply closes without reconnecting.
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!app.show_settings);
+        assert!(!app.reconnect_requested);
+        assert!(app.status_message.contains("applied"));
+    }
+
+    /// Open settings, select the port field and replace its text.
+    fn type_port(app: &mut App, text: &str) {
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Down)); // Port
+        app.handle_event(key_event(KeyCode::Enter)); // edit
+        for _ in 0..10 {
+            app.handle_event(key_event(KeyCode::Backspace));
+        }
+        for c in text.chars() {
+            app.handle_event(key_event(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn test_settings_ctrl_s_reconnects_when_address_changed() {
+        let mut app = new_app();
+        type_port(&mut app, "3000");
+        app.handle_event(key_event(KeyCode::Enter)); // commit field
+        assert_eq!(app.port, 3000);
         app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(!app.show_settings);
         assert!(app.reconnect_requested);
+        assert!(
+            app.status_message
+                .contains("Reconnecting to localhost:3000"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn test_settings_ctrl_s_while_editing_commits_field() {
+        let mut app = new_app();
+        type_port(&mut app, "4000");
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!app.show_settings);
+        assert_eq!(app.port, 4000);
+        assert!(app.reconnect_requested);
+    }
+
+    #[test]
+    fn test_settings_ctrl_s_with_invalid_port_stays_open() {
+        let mut app = new_app();
+        type_port(&mut app, "0");
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.show_settings);
+        assert!(app.settings_editing);
+        assert_eq!(app.port, 2947);
+        assert!(!app.reconnect_requested);
+        assert!(app.settings_message.contains("1-65535"));
+    }
+
+    #[test]
+    fn test_settings_port_digits_only() {
+        let mut app = new_app();
+        type_port(&mut app, "12a3");
+        assert_eq!(app.settings_edit_buf, "123");
+        // The rejection is visible (it was replaced by the later valid digit,
+        // so check by typing a letter last).
+        app.handle_event(key_event(KeyCode::Char('x')));
+        assert!(
+            app.settings_message.contains("digits only"),
+            "{}",
+            app.settings_message
+        );
+        assert_eq!(app.settings_edit_buf, "123");
+    }
+
+    #[test]
+    fn test_settings_port_max_five_digits() {
+        let mut app = new_app();
+        type_port(&mut app, "123456");
+        assert_eq!(app.settings_edit_buf, "12345");
+        assert!(app.settings_message.contains("5 digits"));
+    }
+
+    #[test]
+    fn test_settings_port_out_of_range_rejected_on_enter() {
+        for bad in ["0", "65536", "99999", ""] {
+            let mut app = new_app();
+            type_port(&mut app, bad);
+            app.handle_event(key_event(KeyCode::Enter));
+            assert!(app.settings_editing, "{bad}: should stay editing");
+            assert_eq!(app.port, 2947, "{bad}");
+            assert!(!app.settings_message.is_empty(), "{bad}");
+        }
+        let mut app = new_app();
+        type_port(&mut app, "65535");
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(!app.settings_editing);
+        assert_eq!(app.port, 65535);
+        assert!(app.settings_message.is_empty());
+    }
+
+    #[test]
+    fn test_validate_port() {
+        assert_eq!(validate_port("1"), Ok(1));
+        assert_eq!(validate_port("65535"), Ok(65535));
+        assert!(validate_port("0").is_err());
+        assert!(validate_port("65536").is_err());
+        assert!(validate_port("").is_err());
+        assert!(validate_port("-1").is_err());
+        assert!(validate_port("12ab").is_err());
+        assert!(validate_port("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn test_settings_empty_host_rejected() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Enter));
+        for _ in 0..20 {
+            app.handle_event(key_event(KeyCode::Backspace));
+        }
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.settings_editing);
+        assert_eq!(app.host, "localhost");
+        assert!(app.settings_message.contains("empty"));
+        // Spaces are rejected visibly.
+        app.handle_event(key_event(KeyCode::Char(' ')));
+        assert!(app.settings_edit_buf.is_empty());
+        assert!(app.settings_message.contains("spaces"));
+    }
+
+    #[test]
+    fn test_settings_left_right_cycle_both_ways() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Down));
+        app.handle_event(key_event(KeyCode::Down)); // Units
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.units, UnitSystem::Nautical);
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.units, UnitSystem::Imperial);
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.units, UnitSystem::Nautical);
+
+        app.handle_event(key_event(KeyCode::Down)); // Coords
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.coord_format, CoordFormat::DDM);
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.coord_format, CoordFormat::DD);
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.coord_format, CoordFormat::DMS);
+    }
+
+    #[test]
+    fn test_settings_esc_discards_all_changes() {
+        let mut app = new_app();
+        type_port(&mut app, "5000");
+        app.handle_event(key_event(KeyCode::Enter)); // commit port
+        app.handle_event(key_event(KeyCode::Down)); // Units
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.units, UnitSystem::Imperial); // live preview
+        app.handle_event(key_event(KeyCode::Esc));
+        assert!(!app.show_settings);
+        assert_eq!(app.port, 2947);
+        assert_eq!(app.units, UnitSystem::Metric);
+        assert!(!app.reconnect_requested);
+        assert!(app.status_message.contains("discarded"));
+    }
+
+    #[test]
+    fn test_settings_esc_while_editing_cancels_field_only() {
+        let mut app = new_app();
+        type_port(&mut app, "5000");
+        app.handle_event(key_event(KeyCode::Esc));
+        assert!(app.show_settings);
+        assert!(!app.settings_editing);
+        assert_eq!(app.port, 2947);
+        app.handle_event(key_event(KeyCode::Esc));
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn test_settings_enter_on_save_applies() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Up)); // wraps to Save
+        assert_eq!(app.settings_field, SettingsField::Save);
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(!app.show_settings);
+        assert!(app.settings_snapshot.is_none());
+    }
+
+    #[test]
+    fn test_settings_apply_saves_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/config.toml");
+        let mut app = new_app();
+        app.config_path = Some(path.clone());
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Down));
+        app.handle_event(key_event(KeyCode::Down)); // Units
+        app.handle_event(key_event(KeyCode::Right));
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.status_message.contains("saved to"));
+        let (cfg, outcome) = config::load(&path);
+        assert_eq!(outcome, config::LoadOutcome::Loaded);
+        assert_eq!(cfg.units, UnitSystem::Imperial);
+        assert_eq!(cfg.host, "localhost");
+    }
+
+    #[test]
+    fn test_settings_save_failure_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent "directory" is a file, so saving must fail.
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut app = new_app();
+        app.config_path = Some(blocker.join("config.toml"));
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            app.status_message.contains("NOT saved"),
+            "{}",
+            app.status_message
+        );
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn test_from_startup_applies_config() {
+        let app = App::from_startup(Startup {
+            config: Config {
+                host: "gps.lan".into(),
+                port: 4000,
+                units: UnitSystem::Nautical,
+                coord_format: CoordFormat::DDM,
+            },
+            config_path: Some(PathBuf::from("/nonexistent/config.toml")),
+            message: Some("hello".into()),
+        });
+        assert_eq!(app.host, "gps.lan");
+        assert_eq!(app.port, 4000);
+        assert_eq!(app.units, UnitSystem::Nautical);
+        assert_eq!(app.coord_format, CoordFormat::DDM);
+        assert_eq!(app.status_message, "hello");
+        assert_eq!(app.current_config().port, 4000);
+    }
+
+    #[test]
+    fn test_settings_digits_do_not_switch_tabs() {
+        let mut app = new_app();
+        type_port(&mut app, "3");
+        assert_eq!(app.active_tab, ActiveTab::Dashboard);
+        app.handle_event(key_event(KeyCode::Esc));
+        // Navigation mode in settings also swallows digits.
+        app.handle_event(key_event(KeyCode::Char('4')));
+        assert_eq!(app.active_tab, ActiveTab::Dashboard);
+        assert!(app.show_settings);
     }
 
     #[test]
@@ -1584,22 +2616,142 @@ mod tests {
         assert_eq!(app.nmea_filter, "RMC");
     }
 
-    #[test]
-    fn test_nmea_scroll() {
+    /// NMEA tab with `n` GGA/RMC sentences and a 10-row view.
+    fn nmea_app(n: usize) -> App {
         let mut app = new_app();
         app.active_tab = ActiveTab::Nmea;
+        app.nmea_view_rows.set(10);
+        for i in 0..n {
+            let kind = if i % 2 == 0 { "GGA" } else { "RMC" };
+            app.handle_gpsd_event(GpsdEvent::Nmea(format!("$GP{kind},{i}")));
+        }
+        app
+    }
+
+    #[test]
+    fn test_nmea_scroll() {
+        let mut app = nmea_app(50);
+        assert!(app.nmea_following());
 
         app.handle_event(key_event(KeyCode::Up));
         assert_eq!(app.nmea_scroll_offset, 1);
+        assert!(!app.nmea_following());
 
         app.handle_event(key_event(KeyCode::Down));
         assert_eq!(app.nmea_scroll_offset, 0);
 
+        // Page = view rows - 1
         app.handle_event(key_event(KeyCode::PageUp));
-        assert_eq!(app.nmea_scroll_offset, 20);
+        assert_eq!(app.nmea_scroll_offset, 9);
 
         app.handle_event(key_event(KeyCode::PageDown));
         assert_eq!(app.nmea_scroll_offset, 0);
+
+        app.handle_event(key_event(KeyCode::Home));
+        assert_eq!(app.nmea_scroll_offset, 40); // oldest line at the top
+        app.handle_event(key_event(KeyCode::End));
+        assert_eq!(app.nmea_scroll_offset, 0);
+        assert!(app.nmea_following());
+    }
+
+    #[test]
+    fn test_nmea_scroll_clamped_to_content() {
+        let mut app = nmea_app(15);
+        for _ in 0..30 {
+            app.handle_event(key_event(KeyCode::Up));
+        }
+        assert_eq!(app.nmea_scroll_offset, 5);
+        // One Down press undoes one step, not 25 overshoot steps.
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.nmea_scroll_offset, 4);
+
+        // Fewer lines than the view: nothing to scroll.
+        let mut app = nmea_app(3);
+        app.handle_event(key_event(KeyCode::PageUp));
+        assert_eq!(app.nmea_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_nmea_scroll_clamp_respects_filter() {
+        let mut app = nmea_app(30); // 15 GGA
+        app.handle_event(key_event(KeyCode::Char('f'))); // GGA only
+        app.handle_event(key_event(KeyCode::Home));
+        assert_eq!(app.nmea_scroll_offset, 5);
+    }
+
+    #[test]
+    fn test_nmea_stale_offset_clamped_before_scrolling() {
+        // An offset left over from a longer buffer is clamped first.
+        let mut app = nmea_app(20);
+        app.nmea_scroll_offset = 500;
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.nmea_scroll_offset, 9);
+    }
+
+    /// The lines visible in a `rows`-row window at the current offset.
+    fn nmea_window(app: &App, rows: usize) -> Vec<String> {
+        let mut w: Vec<String> = app
+            .nmea_buffer
+            .iter()
+            .rev()
+            .filter(|s| app.nmea_matches(s))
+            .skip(app.nmea_scroll_offset)
+            .take(rows)
+            .cloned()
+            .collect();
+        w.reverse();
+        w
+    }
+
+    #[test]
+    fn test_nmea_view_anchored_while_scrolled() {
+        let mut app = nmea_app(50);
+        app.handle_event(key_event(KeyCode::PageUp));
+        let before = nmea_window(&app, 10);
+        for i in 0..5 {
+            app.handle_gpsd_event(GpsdEvent::Nmea(format!("$GPGGA,new{i}")));
+        }
+        assert_eq!(nmea_window(&app, 10), before);
+        assert_eq!(app.nmea_scroll_offset, 14);
+    }
+
+    #[test]
+    fn test_nmea_anchor_with_filter_ignores_hidden_lines() {
+        let mut app = nmea_app(50);
+        app.handle_event(key_event(KeyCode::Char('f'))); // GGA
+        app.handle_event(key_event(KeyCode::Up));
+        let before = nmea_window(&app, 10);
+        app.handle_gpsd_event(GpsdEvent::Nmea("$GPRMC,hidden".into()));
+        assert_eq!(app.nmea_scroll_offset, 1);
+        app.handle_gpsd_event(GpsdEvent::Nmea("$GPGGA,shown".into()));
+        assert_eq!(app.nmea_scroll_offset, 2);
+        assert_eq!(nmea_window(&app, 10), before);
+    }
+
+    #[test]
+    fn test_nmea_anchor_at_full_buffer() {
+        let mut app = nmea_app(NMEA_BUFFER_MAX);
+        app.handle_event(key_event(KeyCode::PageUp));
+        let before = nmea_window(&app, 10);
+        app.handle_gpsd_event(GpsdEvent::Nmea("$GPGGA,evicts".into()));
+        assert_eq!(app.nmea_buffer.len(), NMEA_BUFFER_MAX);
+        assert_eq!(nmea_window(&app, 10), before);
+
+        // Scrolled to the very top: evictions slide the view, never past
+        // the end of the content.
+        app.handle_event(key_event(KeyCode::Home));
+        for i in 0..3 {
+            app.handle_gpsd_event(GpsdEvent::Nmea(format!("$GPGGA,x{i}")));
+        }
+        assert_eq!(app.nmea_scroll_offset, app.nmea_max_scroll());
+    }
+
+    #[test]
+    fn test_nmea_following_stays_at_bottom() {
+        let mut app = nmea_app(50);
+        app.handle_gpsd_event(GpsdEvent::Nmea("$GPGGA,latest".into()));
+        assert_eq!(app.nmea_scroll_offset, 0);
+        assert_eq!(nmea_window(&app, 10).last().unwrap(), "$GPGGA,latest");
     }
 
     #[test]
@@ -1803,10 +2955,31 @@ mod tests {
 
     // === Satellites tab ===
 
-    #[test]
-    fn test_satellite_scroll() {
+    /// Satellites tab with `n` satellites and an 8-row view.
+    fn sat_app(n: u16) -> App {
         let mut app = new_app();
         app.active_tab = ActiveTab::Satellites;
+        app.sat_view_rows.set(8);
+        app.gps_data.satellites = (0..n)
+            .map(|i| crate::data_model::SatelliteInfo {
+                prn: i + 1,
+                gnssid: 0,
+                svid: i + 1,
+                elevation: 10.0,
+                azimuth: 10.0,
+                snr: 30.0,
+                used: false,
+                sigid: 0,
+                health: 1,
+                freqid: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn test_satellite_scroll() {
+        let mut app = sat_app(20);
 
         app.handle_event(key_event(KeyCode::Down));
         assert_eq!(app.sat_scroll_offset, 1);
@@ -1817,6 +2990,55 @@ mod tests {
         // Can't scroll below 0
         app.handle_event(key_event(KeyCode::Up));
         assert_eq!(app.sat_scroll_offset, 0);
+
+        app.handle_event(key_event(KeyCode::PageDown));
+        assert_eq!(app.sat_scroll_offset, 7);
+        app.handle_event(key_event(KeyCode::End));
+        assert_eq!(app.sat_scroll_offset, 12);
+        app.handle_event(key_event(KeyCode::PageUp));
+        assert_eq!(app.sat_scroll_offset, 5);
+        app.handle_event(key_event(KeyCode::Home));
+        assert_eq!(app.sat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_satellite_scroll_clamped() {
+        let mut app = sat_app(10);
+        for _ in 0..20 {
+            app.handle_event(key_event(KeyCode::Down));
+        }
+        assert_eq!(app.sat_scroll_offset, 2);
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.sat_scroll_offset, 1);
+
+        // List shrank (satellites set): the old offset is clamped first.
+        app.sat_scroll_offset = 2;
+        app.gps_data.satellites.truncate(9);
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.sat_scroll_offset, 0);
+
+        // Fewer satellites than rows.
+        let mut app = sat_app(3);
+        app.handle_event(key_event(KeyCode::End));
+        assert_eq!(app.sat_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_render_records_view_rows() {
+        use ratatui::backend::TestBackend;
+        let mut app = sat_app(40);
+        app.sat_view_rows.set(0);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| ui::render(f, &app)).unwrap();
+        // 24 rows - tab bar - summary - status - 2 borders - header
+        assert_eq!(app.sat_view_rows.get(), 18);
+        app.handle_event(key_event(KeyCode::End));
+        assert_eq!(app.sat_scroll_offset, 22);
+
+        app.active_tab = ActiveTab::Nmea;
+        term.draw(|f| ui::render(f, &app)).unwrap();
+        // 24 rows - tab bar - status - 2 borders
+        assert_eq!(app.nmea_view_rows.get(), 20);
     }
 
     // === Device tab ===
@@ -1882,6 +3104,15 @@ mod tests {
         assert!(app.device_config.output_log.is_empty());
 
         app.handle_event(key_event(KeyCode::Enter));
+        // Enter only asks for confirmation.
+        assert!(app.pending_device_cmds.is_empty());
+        assert!(app.device_config.output_log.is_empty());
+        let confirm = app.device_config.confirm.as_ref().expect("confirmation");
+        assert!(!confirm.destructive());
+        assert!(app.status_message.contains("Apply nav rate 1 Hz? y/n"));
+
+        app.handle_event(key_event(KeyCode::Char('y')));
+        assert!(app.device_config.confirm.is_none());
         assert_eq!(app.device_config.output_log.len(), 1);
         assert!(app.device_config.output_log[0].contains("nav rate"));
         // Queued, not executed: tests must never run ubxtool against real hardware
@@ -1902,12 +3133,285 @@ mod tests {
         app.gps_data.device.path = "/dev/ttyACM0".to_string();
 
         app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.device_config.confirm.as_ref().unwrap().destructive());
+        assert!(app.status_message.starts_with("WARNING"));
+        assert!(app.pending_device_cmds.is_empty());
+        app.handle_event(key_event(KeyCode::Char('y')));
         assert_eq!(
             app.pending_device_cmds,
             vec![DeviceCommand::BaudRate {
                 speed: SERIAL_SPEEDS[app.device_config.serial_speed_idx],
                 device: "/dev/ttyACM0".to_string(),
             }]
+        );
+    }
+
+    fn device_app(control: usize) -> App {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        app.device_config.selected_control = control;
+        app
+    }
+
+    #[test]
+    fn test_device_confirm_cancel_with_other_key() {
+        for cancel in [
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Down,
+            KeyCode::Char('q'),
+            KeyCode::Tab,
+        ] {
+            let mut app = device_app(0);
+            app.handle_event(key_event(KeyCode::Right)); // 2 Hz, pending
+            app.handle_event(key_event(KeyCode::Enter));
+            assert!(app.device_config.confirm.is_some());
+            app.handle_event(key_event(cancel));
+            assert!(app.device_config.confirm.is_none(), "{cancel:?}");
+            assert!(app.pending_device_cmds.is_empty(), "{cancel:?}");
+            assert!(app.status_message.contains("Cancelled"), "{cancel:?}");
+            // The cancelling key is consumed, not acted on.
+            assert!(!app.should_quit, "{cancel:?}");
+            assert_eq!(app.active_tab, ActiveTab::Device, "{cancel:?}");
+            assert_eq!(app.device_config.selected_control, 0, "{cancel:?}");
+            // Still pending: value differs from the applied one.
+            assert!(app.device_config.is_pending(0));
+        }
+    }
+
+    #[test]
+    fn test_device_pending_vs_applied() {
+        let mut app = device_app(0);
+        assert!(!app.device_config.is_pending(0));
+        app.handle_event(key_event(KeyCode::Right));
+        assert!(app.device_config.is_pending(0));
+        assert!(!app.device_config.sent[0]);
+
+        app.handle_event(key_event(KeyCode::Enter));
+        app.handle_event(key_event(KeyCode::Char('y')));
+        assert!(!app.device_config.is_pending(0));
+        assert!(app.device_config.sent[0]);
+        assert_eq!(app.device_config.applied.nav_rate_idx, 1);
+
+        // Changing back away from the applied value is pending again.
+        app.handle_event(key_event(KeyCode::Left));
+        assert!(app.device_config.is_pending(0));
+        // Other controls untouched.
+        assert!(!app.device_config.is_pending(1));
+    }
+
+    #[test]
+    fn test_device_gnss_disable_is_destructive_enable_is_not() {
+        let mut app = device_app(5); // GLONASS
+        app.handle_event(key_event(KeyCode::Right)); // uncheck
+        assert!(app.device_config.is_pending(5));
+        app.handle_event(key_event(KeyCode::Enter));
+        let c = app.device_config.confirm.clone().unwrap();
+        assert!(c.destructive());
+        assert!(c.prompt.contains("DISABLE GLONASS"));
+        app.handle_event(key_event(KeyCode::Char('y')));
+        assert_eq!(
+            app.pending_device_cmds,
+            vec![DeviceCommand::Ubxtool(vec!["-d".into(), "GLONASS".into()])]
+        );
+        assert!(!app.device_config.is_pending(5));
+
+        app.pending_device_cmds.clear();
+        app.handle_event(key_event(KeyCode::Right)); // re-check
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(!app.device_config.confirm.as_ref().unwrap().destructive());
+        app.handle_event(key_event(KeyCode::Char('Y')));
+        assert_eq!(
+            app.pending_device_cmds,
+            vec![DeviceCommand::Ubxtool(vec!["-e".into(), "GLONASS".into()])]
+        );
+    }
+
+    #[test]
+    fn test_device_save_is_destructive() {
+        let mut app = device_app(DEVICE_CONTROL_COUNT - 1);
+        app.handle_event(key_event(KeyCode::Enter));
+        let c = app.device_config.confirm.clone().unwrap();
+        assert!(c.destructive());
+        assert!(c.prompt.contains("flash"));
+        assert!(app.pending_device_cmds.is_empty());
+        app.handle_event(key_event(KeyCode::Char('y')));
+        assert_eq!(
+            app.pending_device_cmds,
+            vec![DeviceCommand::Ubxtool(vec!["-p".into(), "SAVE".into()])]
+        );
+        assert!(app.device_config.sent[DEVICE_CONTROL_COUNT - 1]);
+    }
+
+    #[test]
+    fn test_device_non_destructive_controls() {
+        for control in [0, 1, 3] {
+            let mut app = device_app(control);
+            app.handle_event(key_event(KeyCode::Enter));
+            let c = app.device_config.confirm.clone().unwrap();
+            assert!(!c.destructive(), "{control}");
+            assert_eq!(c.control, control);
+            assert_eq!(c.commands.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_device_ctrl_y_does_not_confirm() {
+        let mut app = device_app(0);
+        app.handle_event(key_event(KeyCode::Enter));
+        app.handle_event(key_event_mod(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert!(app.pending_device_cmds.is_empty());
+        assert!(app.device_config.confirm.is_none());
+    }
+
+    #[test]
+    fn test_ctrl_c_quits_from_every_state() {
+        let ctrl_c = || key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('?')));
+        assert!(app.show_help);
+        app.handle_event(ctrl_c());
+        assert!(app.should_quit);
+
+        let mut app = device_app(DEVICE_CONTROL_COUNT - 1);
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.device_config.confirm.is_some());
+        app.handle_event(ctrl_c());
+        assert!(app.should_quit);
+        assert!(app.pending_device_cmds.is_empty());
+
+        let mut app = new_app();
+        type_port(&mut app, "12");
+        app.handle_event(ctrl_c());
+        assert!(app.should_quit);
+        assert_eq!(app.settings_edit_buf, "12");
+    }
+
+    // === Help overlay and navigation ===
+
+    #[test]
+    fn test_help_toggle_and_close() {
+        for close in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = new_app();
+            app.handle_event(key_event(KeyCode::Char('?')));
+            assert!(app.show_help);
+            app.handle_event(key_event(close));
+            assert!(!app.show_help, "{close:?}");
+            assert!(!app.should_quit, "{close:?}");
+        }
+    }
+
+    #[test]
+    fn test_help_shift_question_mark() {
+        // Most terminals report '?' with SHIFT.
+        let mut app = new_app();
+        app.handle_event(key_event_mod(KeyCode::Char('?'), KeyModifiers::SHIFT));
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_help_swallows_other_keys() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        app.nmea_buffer.push_back("$GPGGA".into());
+        app.handle_event(key_event(KeyCode::Char('?')));
+        for code in [
+            KeyCode::Char('c'),
+            KeyCode::Char('s'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::Char('r'),
+        ] {
+            app.handle_event(key_event(code));
+        }
+        assert!(app.show_help);
+        assert_eq!(app.nmea_buffer.len(), 1);
+        assert!(!app.show_settings);
+        assert_eq!(app.active_tab, ActiveTab::Nmea);
+        assert!(!app.reconnect_requested);
+    }
+
+    #[test]
+    fn test_number_keys_jump_to_tabs() {
+        let mut app = new_app();
+        for (c, tab) in ['1', '2', '3', '4', '5'].iter().zip(ActiveTab::ALL) {
+            app.handle_event(key_event(KeyCode::Char(*c)));
+            assert_eq!(app.active_tab, *tab);
+        }
+        // Works from every tab, and unbound digits do nothing.
+        for tab in ActiveTab::ALL {
+            app.active_tab = *tab;
+            app.handle_event(key_event(KeyCode::Char('6')));
+            assert_eq!(app.active_tab, *tab);
+            app.handle_event(key_event(KeyCode::Char('2')));
+            assert_eq!(app.active_tab, ActiveTab::Satellites);
+        }
+    }
+
+    #[test]
+    fn test_esc_in_main_view_clears_status() {
+        let mut app = new_app();
+        app.set_status("something");
+        app.handle_event(key_event(KeyCode::Esc));
+        assert!(app.status_message.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_ctrl_chords_unbound_in_main_view() {
+        let mut app = new_app();
+        app.handle_event(key_event_mod(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!app.should_quit);
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn test_no_binding_collisions() {
+        // Every key maps to at most one binding per tab, so global
+        // precedence never hides a tab key.
+        for tab in ActiveTab::ALL {
+            let mut seen = Vec::new();
+            for b in GLOBAL_BINDINGS.iter().chain(tab_bindings(*tab)) {
+                for k in b.keys {
+                    assert!(!seen.contains(k), "{tab:?}: {k:?} bound twice");
+                    seen.push(*k);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_binding_documented() {
+        for b in GLOBAL_BINDINGS
+            .iter()
+            .chain(ActiveTab::ALL.iter().flat_map(|t| tab_bindings(*t)))
+            .chain(SETTINGS_BINDINGS)
+        {
+            assert!(!b.label.is_empty() && !b.desc.is_empty(), "{b:?}");
+            assert!(
+                b.keys.is_empty() == (b.action == Action::Info),
+                "only Info rows may lack keys: {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lookup_binding_scopes_tab_keys() {
+        assert_eq!(
+            lookup_binding(ActiveTab::Nmea, KeyCode::Char('c')).map(|b| b.action),
+            Some(Action::NmeaClear)
+        );
+        assert_eq!(
+            lookup_binding(ActiveTab::Timing, KeyCode::Char('c')).map(|b| b.action),
+            Some(Action::ToffClear)
+        );
+        assert!(lookup_binding(ActiveTab::Dashboard, KeyCode::Char('c')).is_none());
+        assert_eq!(
+            lookup_binding(ActiveTab::Device, KeyCode::Char('q')).map(|b| b.action),
+            Some(Action::Quit)
         );
     }
 
