@@ -96,6 +96,9 @@ impl CoordFormat {
     }
 }
 
+/// Maximum number of lines kept in the Device tab output log.
+pub const OUTPUT_LOG_MAX: usize = 500;
+
 // NMEA filter types to cycle through
 const NMEA_FILTERS: &[&str] = &["", "GGA", "RMC", "GSA", "GSV", "VTG", "GLL", "ZDA"];
 
@@ -187,6 +190,15 @@ impl DeviceConfigState {
             output_log: Vec::new(),
             selected_control: 0,
             proto_version: "18".to_string(),
+        }
+    }
+
+    /// Append a line to the output log, dropping the oldest beyond the cap.
+    pub fn push_log(&mut self, line: impl Into<String>) {
+        self.output_log.push(line.into());
+        if self.output_log.len() > OUTPUT_LOG_MAX {
+            let excess = self.output_log.len() - OUTPUT_LOG_MAX;
+            self.output_log.drain(..excess);
         }
     }
 }
@@ -291,6 +303,16 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) {
+        // Ctrl+C always quits, regardless of tab or overlay.
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.should_quit = true;
+            return;
+        }
+
         if self.show_settings {
             self.handle_settings_input(event);
             return;
@@ -737,30 +759,27 @@ impl App {
             0 => {
                 // Nav rate
                 let (name, ms) = NAV_RATES[dc.nav_rate_idx];
-                dc.output_log
-                    .push(format!("Setting nav rate: {} ({}ms)...", name, ms));
+                dc.push_log(format!("Setting nav rate: {} ({}ms)...", name, ms));
                 self.queue_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)]);
             }
             1 => {
                 // Power mode
                 let (name, mode) = POWER_MODES[dc.power_mode_idx];
-                dc.output_log
-                    .push(format!("Setting power mode: {}...", name));
+                dc.push_log(format!("Setting power mode: {}...", name));
                 self.queue_ubxtool(&["-p", &format!("PMS,{}", mode)]);
             }
             2 => {
                 // Serial speed (two-step: ubxtool then gpsctl)
                 let speed = SERIAL_SPEEDS[dc.serial_speed_idx];
                 let device = self.gps_data.device.path.clone();
-                dc.output_log
-                    .push(format!("Setting baud rate to {}...", speed));
+                dc.push_log(format!("Setting baud rate to {}...", speed));
                 self.pending_device_cmds
                     .push(DeviceCommand::BaudRate { speed, device });
             }
             3 => {
                 // PPS frequency
                 let (name, freq) = PPS_FREQUENCIES[dc.pps_frequency_idx];
-                dc.output_log.push(format!("Setting PPS: {}...", name));
+                dc.push_log(format!("Setting PPS: {}...", name));
                 let cmd = build_tp5_cmd(freq, 100000, true);
                 self.queue_ubxtool(&["-c", &cmd]);
             }
@@ -772,12 +791,12 @@ impl App {
                 let enabled = dc.gnss_enabled[idx];
                 let flag = if enabled { "-e" } else { "-d" };
                 let state = if enabled { "Enabling" } else { "Disabling" };
-                dc.output_log.push(format!("{} {}...", state, name));
+                dc.push_log(format!("{} {}...", state, name));
                 self.queue_ubxtool(&[flag, ubx_name]);
             }
             10 => {
                 // Save config
-                dc.output_log.push("Saving config to flash...".to_string());
+                dc.push_log("Saving config to flash...".to_string());
                 self.queue_ubxtool(&["-p", "SAVE"]);
             }
             _ => {}
@@ -992,7 +1011,7 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
                 // Split multi-line output into separate log entries
                 for line in cmd_output.lines() {
                     if !line.trim().is_empty() {
-                        app.device_config.output_log.push(line.to_string());
+                        app.device_config.push_log(line);
                     }
                 }
             }
@@ -1707,5 +1726,47 @@ mod tests {
         app.handle_gpsd_event(GpsdEvent::Error("connection refused".to_string()));
         assert!(!app.gps_data.connected);
         assert_eq!(app.gps_data.error_message, "connection refused");
+    }
+
+    #[test]
+    fn test_ctrl_c_quits_globally() {
+        // On NMEA tab: quits and does not clear the buffer
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        app.nmea_buffer.push_back("$GPGGA".to_string());
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.nmea_buffer.len(), 1);
+
+        // On Timing tab: quits and keeps TOFF samples
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        app.gps_data.toff_samples = vec![1.0];
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.gps_data.toff_samples.len(), 1);
+
+        // With settings open (even while editing)
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.settings_editing);
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.settings_edit_buf, "localhost");
+    }
+
+    #[test]
+    fn test_output_log_capped() {
+        let mut dc = DeviceConfigState::new();
+        for i in 0..(OUTPUT_LOG_MAX + 50) {
+            dc.push_log(format!("line {i}"));
+        }
+        assert_eq!(dc.output_log.len(), OUTPUT_LOG_MAX);
+        assert_eq!(dc.output_log[0], "line 50");
+        assert_eq!(
+            dc.output_log.last().unwrap(),
+            &format!("line {}", OUTPUT_LOG_MAX + 49)
+        );
     }
 }
