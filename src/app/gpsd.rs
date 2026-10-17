@@ -3,7 +3,6 @@
 
 use super::App;
 use super::nmea::NMEA_BUFFER_MAX;
-use crate::clock_sync::ClockSyncRequest;
 use crate::data_model::GPSData;
 use crate::gpsd_client::{GpsdEvent, GpsdMessage, MsgClass, TaggedEvent};
 
@@ -35,15 +34,10 @@ impl App {
     pub fn handle_gpsd_event(&mut self, event: GpsdEvent) {
         match event {
             GpsdEvent::Connected => {
-                // Fresh connection: drop data from any previous session but
-                // keep app-managed TOFF state.
-                let old = std::mem::take(&mut self.gps_data);
+                // Fresh connection: drop data from any previous session.
+                // App-managed timing state lives outside GPSData and is kept.
                 self.gps_data = GPSData {
                     connected: true,
-                    toff_samples: old.toff_samples,
-                    toff_armed_offset: old.toff_armed_offset,
-                    toff_armed_gps_time: old.toff_armed_gps_time,
-                    toff_armed_sys_time: old.toff_armed_sys_time,
                     ..Default::default()
                 };
                 self.stale = false;
@@ -97,43 +91,8 @@ impl App {
         // A TPV without a timestamp still counts as a new epoch for sampling.
         let new_epoch = time.is_empty() || new_time;
 
-        // TOFF offset against the TPV receipt time
-        if new_time
-            && self.gps_data.last_tpv > 0.0
-            && let Ok(gps_time) = chrono::DateTime::parse_from_rfc3339(time)
-        {
-            let gps_epoch =
-                gps_time.timestamp() as f64 + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
-            let offset = gps_epoch - self.gps_data.last_tpv;
-
-            // Accumulate in circular buffer (max 20)
-            if self.gps_data.toff_samples.len() >= 20 {
-                self.gps_data.toff_samples.remove(0);
-            }
-            self.gps_data.toff_samples.push(offset);
-
-            // Armed single-shot TOFF capture
-            if self.armed_toff {
-                self.armed_toff = false;
-                self.gps_data.toff_armed_offset = offset;
-                self.gps_data.toff_armed_gps_time = self.gps_data.time.clone();
-                self.gps_data.toff_armed_sys_time = self.gps_data.last_tpv;
-                self.set_status(format!(
-                    "TOFF captured: {}",
-                    crate::formatting::fmt_offset(offset)
-                ));
-            }
-        }
-
-        // Armed clock sync: fresh TPV with a 2D/3D fix only. Execution is
-        // deferred to the event loop so it never blocks here.
-        if self.armed_clock_set && new_time && self.gps_data.has_fix() {
-            self.armed_clock_set = false;
-            self.pending_clock_sync = Some(ClockSyncRequest {
-                gps_time: self.gps_data.time.clone(),
-                tpv_receipt: self.gps_data.last_tpv,
-            });
-            self.set_status("Clock sync: setting system clock...");
+        if new_time {
+            self.on_new_tpv_time();
         }
 
         // Log if active (the logger de-duplicates by time)
@@ -272,7 +231,7 @@ mod tests {
     fn test_connected_resets_gps_data_but_keeps_toff() {
         let mut app = new_app();
         app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", now()));
-        app.gps_data.toff_samples = vec![0.1];
+        app.timing.toff_samples = vec![0.1];
         app.handle_gpsd_event(GpsdEvent::Error("closed".to_string()));
         assert!(!app.gps_data.connected);
 
@@ -280,7 +239,7 @@ mod tests {
         assert!(app.gps_data.connected);
         assert!(app.gps_data.error_message.is_empty());
         assert!(app.gps_data.latitude.is_nan());
-        assert_eq!(app.gps_data.toff_samples, vec![0.1]);
+        assert_eq!(app.timing.toff_samples, vec![0.1]);
     }
 
     #[test]

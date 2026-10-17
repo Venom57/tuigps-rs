@@ -199,12 +199,6 @@ pub struct GPSData {
     pub device: DeviceInfo,
     pub version: VersionInfo,
 
-    // TOFF accumulation
-    pub toff_samples: Vec<f64>,
-    pub toff_armed_offset: f64,
-    pub toff_armed_gps_time: String,
-    pub toff_armed_sys_time: f64,
-
     // Satellites
     pub satellites: Vec<SatelliteInfo>,
     pub satellites_used: u32,
@@ -246,11 +240,6 @@ impl Default for GPSData {
             toff: TOFFData::default(),
             device: DeviceInfo::default(),
             version: VersionInfo::default(),
-
-            toff_samples: Vec::new(),
-            toff_armed_offset: f64::NAN,
-            toff_armed_gps_time: String::new(),
-            toff_armed_sys_time: f64::NAN,
 
             satellites: Vec::new(),
             satellites_used: 0,

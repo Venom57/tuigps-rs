@@ -49,6 +49,7 @@ pub use keys::{
 pub use nmea::NMEA_BUFFER_MAX;
 pub use scroll::Scroll;
 pub use settings::{SettingsField, validate_port};
+pub use timing::TimingState;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActiveTab {
@@ -188,8 +189,8 @@ pub struct App {
     pub pending_device_cmds: Vec<DeviceCommand>,
 
     // Clock sync
-    pub armed_clock_set: bool,
-    pub armed_toff: bool,
+    /// TOFF samples/capture and clock-sync arming (Timing tab).
+    pub timing: TimingState,
     /// Clock sync request waiting to be dispatched by the event loop.
     pub pending_clock_sync: Option<ClockSyncRequest>,
 
@@ -251,8 +252,7 @@ impl App {
             sat_view_rows: Cell::new(0),
             device_config: DeviceConfigState::new(),
             pending_device_cmds: Vec::new(),
-            armed_clock_set: false,
-            armed_toff: false,
+            timing: TimingState::default(),
             pending_clock_sync: None,
             connection_generation: 0,
             stale: false,
@@ -395,20 +395,9 @@ impl App {
                 self.nmea_scroll_offset = 0;
                 self.set_status("NMEA buffer cleared");
             }
-            Action::ToffArm => {
-                self.armed_toff = true;
-                self.set_status("TOFF armed — waiting for next fix...");
-            }
+            Action::ToffArm => self.arm_toff(),
             Action::ToffClear => self.clear_toff(),
-            Action::ClockSyncToggle => {
-                if self.armed_clock_set {
-                    self.armed_clock_set = false;
-                    self.set_status("Clock sync disarmed");
-                } else {
-                    self.armed_clock_set = true;
-                    self.set_status("Clock sync ARMED — will fire on next 2D/3D fix");
-                }
-            }
+            Action::ClockSyncToggle => self.toggle_clock_sync(),
             Action::DeviceSelect => {
                 let dc = &mut self.device_config;
                 if code == KeyCode::Up {
@@ -653,10 +642,10 @@ mod tests {
         // On Timing tab: quits and keeps TOFF samples
         let mut app = new_app();
         app.active_tab = ActiveTab::Timing;
-        app.gps_data.toff_samples = vec![1.0];
+        app.timing.toff_samples = vec![1.0];
         app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
-        assert_eq!(app.gps_data.toff_samples.len(), 1);
+        assert_eq!(app.timing.toff_samples.len(), 1);
 
         // With settings open (even while editing)
         let mut app = new_app();

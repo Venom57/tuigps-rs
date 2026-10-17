@@ -111,9 +111,9 @@ fn populated_app() -> App {
     d.device.bps = 115_200;
     d.device.cycle = 1.0;
     d.version.release = "3.25".into();
-    d.toff_samples = vec![1e-4, -2e-4, 3e-5, f64::NAN];
-    d.toff_armed_offset = 1.5e-4;
-    d.toff_armed_gps_time = "2026-10-17T12:34:56Z".into();
+    app.timing.toff_samples = vec![1e-4, -2e-4, 3e-5, f64::NAN];
+    app.timing.toff_armed_offset = 1.5e-4;
+    app.timing.toff_armed_gps_time = "2026-10-17T12:34:56Z".into();
     d.satellites = satellites();
     d.satellites_used = 22;
 
