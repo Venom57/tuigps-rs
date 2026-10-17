@@ -17,6 +17,12 @@ ignore = [
     # paste is unmaintained (archived); pulled in by ratatui 0.29 with no
     # upgrade path yet. Revisit when bumping ratatui.
     { id = "RUSTSEC-2024-0436", reason = "transitive via ratatui 0.29; no fix available" },
+    # zbus 5 internals, folded into zbus 6 (which needs Rust 1.89, above our
+    # 1.88 MSRV). zbus is only reachable via the stub `dbus` feature, which
+    # never calls it. Bump to zbus 6 when implementing D-Bus or raising MSRV.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: optional stub dbus feature; fix needs MSRV 1.89" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: optional stub dbus feature; fix needs MSRV 1.89" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: optional stub dbus feature; fix needs MSRV 1.89" },
 ]
 
 [licenses]
