@@ -76,7 +76,7 @@ pub fn render_hold(f: &mut Frame, area: Rect, app: &App) {
     let lines = match hold.result() {
         None => vec![
             Line::styled("Collecting fixes\u{2026}", Style::default().bold()),
-            Line::styled("stats after 2 fixes", dim),
+            Line::styled(format!("{} of 2 fixes for stats", hold.count()), dim),
         ],
         Some(r) => {
             let cep = |label: &'static str, v: f64| {

@@ -258,6 +258,13 @@ fn json_f64(msg: &Value, key: &str) -> f64 {
     msg[key].as_f64().unwrap_or(f64::NAN)
 }
 
+/// Coordinate field `key`; values outside `[-limit, limit]` are treated as
+/// missing so a corrupt message can't produce a bogus fix.
+fn json_coord(msg: &Value, key: &str, limit: f64) -> f64 {
+    let v = json_f64(msg, key);
+    if v.abs() <= limit { v } else { f64::NAN }
+}
+
 /// Integer field `key` as `T`, or `None` if it is absent, not an integer, or
 /// out of range for `T`. Out-of-range values are never silently truncated
 /// (e.g. `"mode":259` must not become mode 3).
@@ -276,8 +283,8 @@ fn extract_tpv(msg: &Value, data: &mut GPSData) {
     data.mode = FixMode::from(json_int::<u8>(msg, "mode").unwrap_or(0));
     data.status = FixStatus::from(json_int::<u8>(msg, "status").unwrap_or(0));
 
-    data.latitude = json_f64(msg, "lat");
-    data.longitude = json_f64(msg, "lon");
+    data.latitude = json_coord(msg, "lat", 90.0);
+    data.longitude = json_coord(msg, "lon", 180.0);
     data.alt_hae = json_f64(msg, "altHAE");
     data.alt_msl = json_f64(msg, "altMSL");
     data.geoid_sep = json_f64(msg, "geoidSep");
@@ -430,6 +437,23 @@ mod tests {
     fn test_json_f64_missing() {
         let v: Value = serde_json::from_str(r#"{}"#).unwrap();
         assert!(json_f64(&v, "lat").is_nan());
+    }
+
+    #[test]
+    fn test_extract_tpv_rejects_out_of_range_coords() {
+        let mut data = GPSData::default();
+        let msg: Value =
+            serde_json::from_str(r#"{"class":"TPV","mode":3,"lat":1e308,"lon":-181.0}"#).unwrap();
+        extract_tpv(&msg, &mut data);
+        assert!(data.latitude.is_nan());
+        assert!(data.longitude.is_nan());
+        assert!(!data.has_fix());
+
+        let msg: Value =
+            serde_json::from_str(r#"{"class":"TPV","mode":3,"lat":-90.0,"lon":180.0}"#).unwrap();
+        extract_tpv(&msg, &mut data);
+        assert_eq!(data.latitude, -90.0);
+        assert_eq!(data.longitude, 180.0);
     }
 
     #[test]

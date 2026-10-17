@@ -584,13 +584,14 @@ fn malformed_pps_extremes() {
 }
 
 #[test]
-fn malformed_huge_floats_pass_through_finite() {
+fn malformed_huge_coords_are_rejected() {
     let l = lines("malformed.jsonl");
     let mut d = GPSData::default();
     apply(&mut d, &l[m::HUGE_FLOATS], 1.0);
-    assert_eq!(d.latitude, 1e308);
-    assert_eq!(d.longitude, -1e308);
-    assert!(d.latitude.is_finite() && d.longitude.is_finite());
+    // Out-of-range lat/lon are treated as missing, so no bogus fix appears
+    assert!(d.latitude.is_nan());
+    assert!(d.longitude.is_nan());
+    assert!(!d.has_fix());
 }
 
 #[test]

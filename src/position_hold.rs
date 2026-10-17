@@ -124,6 +124,11 @@ impl PositionHold {
         }
     }
 
+    /// Number of lat/lon fixes accumulated so far.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
     /// Add one fix. Fixes with non-finite lat/lon are ignored entirely; a
     /// non-finite altitude only excludes the fix from altitude statistics.
     pub fn add_fix(&mut self, lat: f64, lon: f64, alt: f64) {
@@ -284,6 +289,15 @@ fn disc_probability(s1: f64, s2: f64, r: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_tracks_accepted_fixes_only() {
+        let mut h = PositionHold::new();
+        assert_eq!(h.count(), 0);
+        h.add_fix(51.5, -0.1, 10.0);
+        h.add_fix(f64::NAN, -0.1, 10.0);
+        assert_eq!(h.count(), 1);
+    }
 
     #[test]
     fn test_empty_result() {
