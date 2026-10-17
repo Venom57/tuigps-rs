@@ -65,3 +65,6 @@ dbus = ["dep:zbus"]
 
 [dev-dependencies]
 tempfile = "3"
+quick-xml = "0.37"
+csv = "1"
+proptest = "1"

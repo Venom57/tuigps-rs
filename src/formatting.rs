@@ -7,66 +7,88 @@ pub fn fmt(value: f64, decimals: usize, suffix: &str) -> String {
     }
 }
 
-/// Format coordinate in DD, DMS, or DDM
+/// Format coordinate in DD, DMS, or DDM.
+///
+/// `axis` is `"lat"` (N/S) or anything else (E/W); `style` is `"dms"`,
+/// `"ddm"`, or anything else for decimal degrees. Output examples:
+///
+/// - dd:  `51.5074000° N` (7 decimals)
+/// - dms: `51° 30' 26.640" N` (seconds to 3 decimals)
+/// - ddm: `51° 30.444000' N` (minutes to 6 decimals)
+///
+/// Rounding is done once on the smallest displayed unit and then split into
+/// degrees/minutes/seconds, so a carry propagates (59.9999" shows as the next
+/// minute, never as `60.000"`). A value that rounds to zero gets the positive
+/// hemisphere letter. Non-finite input yields `---`.
 pub fn fmt_coord(value: f64, axis: &str, style: &str) -> String {
     if !value.is_finite() {
         return "---".to_string();
     }
 
-    let dir = match axis {
-        "lat" => {
-            if value >= 0.0 {
-                "N"
-            } else {
-                "S"
-            }
-        }
-        _ => {
-            if value >= 0.0 {
-                "E"
-            } else {
-                "W"
-            }
+    let abs = value.abs();
+    let hemisphere = |rounded_is_zero: bool| {
+        let positive = value >= 0.0 || rounded_is_zero;
+        match (axis, positive) {
+            ("lat", true) => "N",
+            ("lat", false) => "S",
+            (_, true) => "E",
+            (_, false) => "W",
         }
     };
-    let abs = value.abs();
 
     match style {
         "dms" => {
-            let d = abs as u32;
-            let m = ((abs - d as f64) * 60.0) as u32;
-            let s = (abs - d as f64 - m as f64 / 60.0) * 3600.0;
-            format!("{}° {:02}' {:06.3}\" {}", d, m, s, dir)
+            // Whole milliarcseconds.
+            let total = (abs * 3_600_000.0).round() as u64;
+            let d = total / 3_600_000;
+            let m = (total / 60_000) % 60;
+            let ms = total % 60_000;
+            format!(
+                "{}° {:02}' {:02}.{:03}\" {}",
+                d,
+                m,
+                ms / 1000,
+                ms % 1000,
+                hemisphere(total == 0)
+            )
         }
         "ddm" => {
-            let d = abs as u32;
-            let m = (abs - d as f64) * 60.0;
-            format!("{}° {:09.6}' {}", d, m, dir)
+            // Whole micro-minutes.
+            let total = (abs * 60_000_000.0).round() as u64;
+            let d = total / 60_000_000;
+            let um = total % 60_000_000;
+            format!(
+                "{}° {:02}.{:06}' {}",
+                d,
+                um / 1_000_000,
+                um % 1_000_000,
+                hemisphere(total == 0)
+            )
         }
-        _ => format!("{:.7}° {}", abs, dir), // "dd"
+        _ => {
+            let rounded_is_zero = (abs * 1e7).round() == 0.0;
+            format!("{:.7}° {}", abs, hemisphere(rounded_is_zero))
+        }
     }
 }
 
-/// Convert m/s to display unit
+/// Convert m/s to display unit. Non-finite input (or a conversion that
+/// overflows) yields `---`.
 pub fn fmt_speed(mps: f64, unit: &str) -> String {
-    if !mps.is_finite() {
-        return "---".to_string();
-    }
-    match unit {
-        "imperial" => format!("{:.1} mph", mps * 2.236936),
-        "nautical" => format!("{:.1} kn", mps * 1.943844),
-        _ => format!("{:.1} km/h", mps * 3.6),
-    }
+    let (factor, label) = match unit {
+        "imperial" => (2.236936, "mph"),
+        "nautical" => (1.943844, "kn"),
+        _ => (3.6, "km/h"),
+    };
+    fmt(mps * factor, 1, &format!(" {label}"))
 }
 
-/// Convert meters to display unit
+/// Convert meters to display unit. Non-finite input (or a conversion that
+/// overflows) yields `---`.
 pub fn fmt_altitude(meters: f64, unit: &str) -> String {
-    if !meters.is_finite() {
-        return "---".to_string();
-    }
     match unit {
-        "imperial" | "nautical" => format!("{:.1} ft", meters * 3.28084),
-        _ => format!("{:.1} m", meters),
+        "imperial" | "nautical" => fmt(meters * 3.28084, 1, " ft"),
+        _ => fmt(meters, 1, " m"),
     }
 }
 
@@ -84,22 +106,40 @@ pub fn fmt_time_iso(iso: &str) -> (String, String) {
     }
 }
 
-/// Format time offset intelligently (ns/us/ms/s)
+/// Format time offset intelligently (ns/us/ms/s).
+///
+/// The unit is chosen on the *rounded* magnitude so values just below a unit
+/// boundary display as e.g. `+1.000 us`, never `+1000.0 ns`. A value that
+/// rounds to zero is shown with a `+` sign.
 pub fn fmt_offset(offset_sec: f64) -> String {
     if !offset_sec.is_finite() {
         return "---".to_string();
     }
     let abs = offset_sec.abs();
-    let sign = if offset_sec < 0.0 { "-" } else { "+" };
-    if abs < 1e-6 {
-        format!("{}{:.1} ns", sign, abs * 1e9)
-    } else if abs < 1e-3 {
-        format!("{}{:.3} us", sign, abs * 1e6)
-    } else if abs < 1.0 {
-        format!("{}{:.3} ms", sign, abs * 1e3)
-    } else {
-        format!("{}{:.3} s", sign, abs)
+    // Format in the smallest unit whose *formatted* magnitude stays below
+    // 1000; checking the formatted text avoids float/decimal rounding skew.
+    let units: [(f64, usize, &str); 4] = [
+        (1e9, 1, "ns"),
+        (1e6, 3, "us"),
+        (1e3, 3, "ms"),
+        (1.0, 3, "s"),
+    ];
+    let mut text = String::new();
+    let mut unit = "s";
+    for (scale, decimals, name) in units {
+        text = format!("{:.*}", decimals, abs * scale);
+        unit = name;
+        if text.parse::<f64>().is_ok_and(|v| v < 1000.0) {
+            break;
+        }
     }
+    let is_zero = text.bytes().all(|b| b == b'0' || b == b'.');
+    let sign = if offset_sec < 0.0 && !is_zero {
+        "-"
+    } else {
+        "+"
+    };
+    format!("{sign}{text} {unit}")
 }
 
 #[cfg(test)]
