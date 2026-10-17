@@ -1,11 +1,14 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::data_model::*;
+
+/// Maximum accepted length of a single gpsd line. Longer lines are discarded.
+pub const MAX_LINE_LEN: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum GpsdEvent {
@@ -49,20 +52,22 @@ async fn connect_and_read(
     writer.write_all(b"\n").await?;
 
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut buf = Vec::with_capacity(4096);
     let mut data = GPSData {
         connected: true,
         ..Default::default()
     };
 
     loop {
-        line.clear();
         tokio::select! {
-            result = reader.read_line(&mut line) => {
-                let n = result?;
-                if n == 0 {
-                    return Err(anyhow!("gpsd connection closed"));
+            result = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LEN) => {
+                match result? {
+                    LineRead::Eof => return Err(anyhow!("gpsd connection closed")),
+                    LineRead::Oversized => continue,
+                    LineRead::Line => {}
                 }
+                // Invalid UTF-8 is replaced rather than dropping the connection
+                let line = String::from_utf8_lossy(&buf);
 
                 let receipt_time = std::time::SystemTime::now()
                     .duration_since(UNIX_EPOCH)?
@@ -101,6 +106,62 @@ fn process_message(line: &str, data: &mut GPSData, receipt_time: f64) {
     }
 
     data.last_seen = receipt_time;
+}
+
+/// Outcome of [`read_line_bounded`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineRead {
+    /// A line (without its trailing newline) is in the buffer.
+    Line,
+    /// A line longer than the limit was read and discarded.
+    Oversized,
+    /// End of stream, no more data.
+    Eof,
+}
+
+/// Read one `\n`-terminated line into `buf` (newline stripped), never holding
+/// more than `max` bytes. Oversized lines are consumed and discarded.
+pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let chunk = match newline {
+            Some(i) => &available[..i],
+            None => available,
+        };
+        if !oversized {
+            if buf.len() + chunk.len() > max {
+                oversized = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        let consumed = newline.map_or(available.len(), |i| i + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else {
+                LineRead::Line
+            });
+        }
+    }
 }
 
 fn json_f64(msg: &Value, key: &str) -> f64 {
@@ -394,5 +455,58 @@ mod tests {
         let mut data = GPSData::default();
         process_message(r#"{"class": "UNKNOWN"}"#, &mut data, 100.0);
         assert!((data.last_seen - 100.0).abs() < 1e-10);
+    }
+
+    // === Bounded line reader ===
+
+    async fn read_all_lines(input: &[u8], cap: usize, max: usize) -> Vec<(LineRead, Vec<u8>)> {
+        let mut reader = BufReader::with_capacity(cap, input);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            let r = read_line_bounded(&mut reader, &mut buf, max).await.unwrap();
+            let done = r == LineRead::Eof;
+            out.push((r, buf.clone()));
+            if done {
+                return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_lines_and_eof() {
+        let out = read_all_lines(b"abc\ndef\nghi", 2, 100).await;
+        assert_eq!(
+            out,
+            vec![
+                (LineRead::Line, b"abc".to_vec()),
+                (LineRead::Line, b"def".to_vec()),
+                (LineRead::Line, b"ghi".to_vec()),
+                (LineRead::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_discards_oversized() {
+        let mut input = vec![b'x'; 50];
+        input.extend_from_slice(b"\nok\n");
+        input.extend_from_slice(&[b'y'; 20]); // oversized, unterminated at EOF
+        let out = read_all_lines(&input, 4, 10).await;
+        assert_eq!(
+            out,
+            vec![
+                (LineRead::Oversized, vec![]),
+                (LineRead::Line, b"ok".to_vec()),
+                (LineRead::Oversized, vec![]),
+                (LineRead::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_exact_limit_ok() {
+        let out = read_all_lines(b"0123456789\n", 3, 10).await;
+        assert_eq!(out[0], (LineRead::Line, b"0123456789".to_vec()));
     }
 }
