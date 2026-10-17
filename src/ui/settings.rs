@@ -7,9 +7,12 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, area);
 
     let dialog_area = centered_rect(62, 20, area);
+    // Terminal-default background with a colored border: text styles below
+    // use the default foreground (or Yellow accents) so every line is
+    // readable on both dark and light themes. Only the divider is DarkGray.
     let block = Block::bordered()
         .title(" Settings ")
-        .style(Style::default().bg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(dialog_area);
     f.render_widget(block, dialog_area);
 
@@ -30,7 +33,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
 
     let lines = vec![
         Line::raw(""),
-        Line::styled("  Connection", Style::default().fg(Color::White).bold()),
+        Line::styled("  Connection", Style::default().bold().underlined()),
         render_field(
             "Host",
             if editing && sel == SettingsField::Host {
@@ -54,7 +57,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             "gpsd port (default 2947)",
         ),
         Line::raw(""),
-        Line::styled("  Display", Style::default().fg(Color::White).bold()),
+        Line::styled("  Display", Style::default().bold().underlined()),
         render_cycle_field(
             "Units",
             app.units.as_str(),
@@ -72,18 +75,12 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             "  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             Style::default().fg(Color::DarkGray),
         ),
-        Line::styled(
-            "  Up/Down  navigate    Enter  edit / cycle value",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Line::styled(
-            "  \u{2190}/\u{2192}    cycle value  Esc    close",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Line::styled(
-            "  Ctrl+S   apply & reconnect to gpsd",
-            Style::default().fg(Color::DarkGray),
-        ),
+        help_line(&[("Up/Down", "navigate    "), ("Enter", "edit / cycle value")]),
+        help_line(&[
+            ("\u{2190}/\u{2192}    ", "cycle value "),
+            ("Esc  ", "close"),
+        ]),
+        help_line(&[("Ctrl+S ", "apply & reconnect to gpsd")]),
     ];
 
     f.render_widget(Paragraph::new(lines), inner);
@@ -98,11 +95,11 @@ fn render_field<'a>(
 ) -> Line<'a> {
     let marker = if selected { "> " } else { "  " };
     let value_style = if editing {
-        Style::default().fg(Color::Yellow).bg(Color::Black).bold()
+        Style::default().fg(Color::Yellow).bold().underlined()
     } else if selected {
-        Style::default().fg(Color::White).bold()
+        Style::default().bold()
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default()
     };
 
     let display = if editing {
@@ -121,7 +118,7 @@ fn render_field<'a>(
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::raw(format!("{:<8}", format!("{}:", label))),
         Span::styled(display, value_style),
-        Span::styled(hint_text, Style::default().fg(Color::DarkGray)),
+        Span::styled(hint_text, Style::default().italic()),
     ])
 }
 
@@ -130,7 +127,7 @@ fn render_cycle_field<'a>(label: &str, value: &str, selected: bool, description:
     let value_style = if selected {
         Style::default().fg(Color::Yellow).bold()
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default()
     };
     let arrows = if selected { " \u{25c0} \u{25b6} " } else { "" };
 
@@ -140,9 +137,23 @@ fn render_cycle_field<'a>(label: &str, value: &str, selected: bool, description:
         Span::styled(marker, Style::default().fg(Color::Yellow)),
         Span::raw(format!("{:<8}", format!("{}:", label))),
         Span::styled(value.to_string(), value_style),
-        Span::styled(arrows, Style::default().fg(Color::DarkGray)),
-        Span::styled(desc_text, Style::default().fg(Color::DarkGray)),
+        Span::styled(arrows, Style::default().fg(Color::Yellow)),
+        Span::styled(desc_text, Style::default().italic()),
     ])
+}
+
+/// A help line: keys in bold yellow, descriptions in the default color.
+fn help_line<'a>(items: &[(&'a str, &'a str)]) -> Line<'a> {
+    let mut spans = vec![Span::raw("  ")];
+    for (key, desc) in items {
+        spans.push(Span::styled(
+            *key,
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(*desc));
+    }
+    Line::from(spans)
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
