@@ -161,7 +161,10 @@ pub struct VersionInfo {
 pub struct GPSData {
     // Connection state
     pub connected: bool,
+    /// Local receipt time (unix seconds) of the last message of any class.
     pub last_seen: f64,
+    /// Local receipt time (unix seconds) of the last TPV message.
+    pub last_tpv: f64,
     pub error_message: String,
 
     // TPV
@@ -196,12 +199,6 @@ pub struct GPSData {
     pub device: DeviceInfo,
     pub version: VersionInfo,
 
-    // TOFF accumulation
-    pub toff_samples: Vec<f64>,
-    pub toff_armed_offset: f64,
-    pub toff_armed_gps_time: String,
-    pub toff_armed_sys_time: f64,
-
     // Satellites
     pub satellites: Vec<SatelliteInfo>,
     pub satellites_used: u32,
@@ -212,6 +209,7 @@ impl Default for GPSData {
         Self {
             connected: false,
             last_seen: 0.0,
+            last_tpv: 0.0,
             error_message: String::new(),
 
             latitude: f64::NAN,
@@ -243,11 +241,6 @@ impl Default for GPSData {
             device: DeviceInfo::default(),
             version: VersionInfo::default(),
 
-            toff_samples: Vec::new(),
-            toff_armed_offset: f64::NAN,
-            toff_armed_gps_time: String::new(),
-            toff_armed_sys_time: f64::NAN,
-
             satellites: Vec::new(),
             satellites_used: 0,
         }
@@ -274,11 +267,12 @@ impl GPSData {
             && self.longitude.is_finite()
     }
 
-    /// PPS offset in microseconds
+    /// PPS offset in microseconds. Differences are taken in i128 so
+    /// out-of-range values from a malformed PPS message cannot overflow.
     pub fn pps_offset_us(&self) -> f64 {
-        let offset_sec =
-            (self.pps.real_sec - self.pps.clock_sec) as f64
-            + (self.pps.real_nsec - self.pps.clock_nsec) as f64 / 1e9;
+        let diff = |a: i64, b: i64| (i128::from(a) - i128::from(b)) as f64;
+        let offset_sec = diff(self.pps.real_sec, self.pps.clock_sec)
+            + diff(self.pps.real_nsec, self.pps.clock_nsec) / 1e9;
         offset_sec * 1e6
     }
 }
@@ -324,47 +318,90 @@ mod tests {
 
     #[test]
     fn test_has_fix_3d() {
-        let mut d = GPSData::default();
-        d.mode = FixMode::Fix3D;
-        d.latitude = 51.5;
-        d.longitude = -0.1;
+        let d = GPSData {
+            mode: FixMode::Fix3D,
+            latitude: 51.5,
+            longitude: -0.1,
+            ..Default::default()
+        };
         assert!(d.has_fix());
     }
 
     #[test]
     fn test_has_fix_2d() {
-        let mut d = GPSData::default();
-        d.mode = FixMode::Fix2D;
-        d.latitude = 51.5;
-        d.longitude = -0.1;
+        let d = GPSData {
+            mode: FixMode::Fix2D,
+            latitude: 51.5,
+            longitude: -0.1,
+            ..Default::default()
+        };
         assert!(d.has_fix());
     }
 
     #[test]
     fn test_has_fix_nofix() {
-        let mut d = GPSData::default();
-        d.mode = FixMode::NoFix;
-        d.latitude = 51.5;
-        d.longitude = -0.1;
+        let d = GPSData {
+            mode: FixMode::NoFix,
+            latitude: 51.5,
+            longitude: -0.1,
+            ..Default::default()
+        };
         assert!(!d.has_fix());
     }
 
     #[test]
     fn test_has_fix_nan_coords() {
-        let mut d = GPSData::default();
-        d.mode = FixMode::Fix3D;
+        let d = GPSData {
+            mode: FixMode::Fix3D,
+            ..Default::default()
+        };
         // lat/lon are NaN by default
         assert!(!d.has_fix());
     }
 
     #[test]
     fn test_constellation_counts() {
-        let mut d = GPSData::default();
-        d.satellites = vec![
-            SatelliteInfo { prn: 1, gnssid: 0, svid: 1, elevation: 45.0, azimuth: 180.0, snr: 35.0, used: true, sigid: 0, health: 1, freqid: None },
-            SatelliteInfo { prn: 2, gnssid: 0, svid: 2, elevation: 30.0, azimuth: 90.0, snr: 25.0, used: false, sigid: 0, health: 1, freqid: None },
-            SatelliteInfo { prn: 65, gnssid: 2, svid: 1, elevation: 60.0, azimuth: 270.0, snr: 40.0, used: true, sigid: 0, health: 1, freqid: None },
-        ];
+        let d = GPSData {
+            satellites: vec![
+                SatelliteInfo {
+                    prn: 1,
+                    gnssid: 0,
+                    svid: 1,
+                    elevation: 45.0,
+                    azimuth: 180.0,
+                    snr: 35.0,
+                    used: true,
+                    sigid: 0,
+                    health: 1,
+                    freqid: None,
+                },
+                SatelliteInfo {
+                    prn: 2,
+                    gnssid: 0,
+                    svid: 2,
+                    elevation: 30.0,
+                    azimuth: 90.0,
+                    snr: 25.0,
+                    used: false,
+                    sigid: 0,
+                    health: 1,
+                    freqid: None,
+                },
+                SatelliteInfo {
+                    prn: 65,
+                    gnssid: 2,
+                    svid: 1,
+                    elevation: 60.0,
+                    azimuth: 270.0,
+                    snr: 40.0,
+                    used: true,
+                    sigid: 0,
+                    health: 1,
+                    freqid: None,
+                },
+            ],
+            ..Default::default()
+        };
         let counts = d.constellation_counts();
         assert_eq!(counts[&0], (2, 1)); // GPS: 2 visible, 1 used
         assert_eq!(counts[&2], (1, 1)); // Galileo: 1 visible, 1 used
@@ -388,5 +425,19 @@ mod tests {
         d.pps.clock_nsec = 0;
         let offset = d.pps_offset_us();
         assert!((offset - 0.5).abs() < 1e-6); // 500ns = 0.5us
+    }
+
+    #[test]
+    fn test_pps_offset_us_extreme_values_do_not_overflow() {
+        // Values a malformed PPS message can carry; used to panic in debug
+        // builds with "attempt to subtract with overflow".
+        let mut d = GPSData::default();
+        d.pps.real_sec = i64::MAX;
+        d.pps.clock_sec = i64::MIN;
+        d.pps.real_nsec = i64::MIN;
+        d.pps.clock_nsec = i64::MAX;
+        let offset = d.pps_offset_us();
+        assert!(offset.is_finite());
+        assert!(offset > 1e24); // ~1.8e19 s
     }
 }

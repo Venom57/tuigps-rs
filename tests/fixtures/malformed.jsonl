@@ -1,0 +1,26 @@
+{"class":"TPV","device":"/dev/ttyACM0","mode":3,"time":"2024-05-12T14:05:09.000Z","lat":51.4
+{"class":"TPV","device":"/dev/ttyACM0","mode":"3","status":"2","lat":"abc","lon":null,"altMSL":true,"time":12345,"leapseconds":"18"}
+{"class":"SKY","device":"/dev/ttyACM0","satellites":[{"PRN":70000,"gnssid":0,"svid":70000,"el":45.0,"az":180.0,"ss":40.0,"used":true}]}
+{"class":"TPV","device":"/dev/ttyACM0","mode":-1,"status":-5}
+{"class":"TPV","device":"/dev/ttyACM0","mode":259,"status":257,"lat":10.0,"lon":20.0}
+{"class":"TPV","device":"/dev/ttyACM0","mode":3,"lat":1e308,"lon":-1e308,"leapseconds":4294967314}
+{"class":"PPS","device":"/dev/pps0","real_sec":9223372036854775807,"real_nsec":999999999,"clock_sec":-9223372036854775808,"clock_nsec":-999999999,"precision":-4294967296,"qErr":18446744073709551615}
+{"class":"TPV","device":"/dev/ttyACM0","mode":3,"lat":1e400,"lon":0.0}
+{"class":42}
+{"class":null}
+[1,2,3]
+"TPV"
+null
+{}
+{"class":"tpv","mode":3,"lat":1.0,"lon":2.0}
+{"class":"SKY","device":"/dev/ttyACM0","hdop":"1.0","satellites":{"PRN":1}}
+{"class":"SKY","device":"/dev/ttyACM0","satellites":[1,"x",null,[],{"PRN":9,"used":true,"gnssid":0,"svid":9}]}
+{"class":"DEVICE","path":42,"driver":["u-blox"],"bps":"9600","native":300,"cycle":"1.0","mincycle":null}
+{"class":"DEVICES","devices":{"path":"/dev/ttyX"}}
+{"class":"SKY","device":"/dev/ttyACM0","satellites":[{"PRN":70,"gnssid":300,"svid":70,"sigid":-1,"health":999,"freqid":200,"used":"yes"}]}
+{"class":"VERSION","release":3.25,"proto_major":"3","proto_minor":-15}
+
+   	  
+$GPGGA,140509.00,5128.67570,N,00000.09270,W,1,08,0.81,45.6,M,45.8,M,,*7C
+﻿{"class":"TPV","device":"/dev/ttyACM0","mode":3,"lat":1.0,"lon":2.0}
+{"class":"TPV","device":"/dev/ttyACM0","mode":3,"lat":1.0,"lon":2.0} trailing garbage

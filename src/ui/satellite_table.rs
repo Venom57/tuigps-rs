@@ -7,10 +7,12 @@ use crate::formatting::fmt;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let mut sats: Vec<_> = app.gps_data.satellites.iter().collect();
-    sats.sort_by(|a, b| a.gnssid.cmp(&b.gnssid).then(a.prn.cmp(&b.prn)));
+    sats.sort_unstable_by_key(|s| (s.gnssid, s.prn, s.sigid));
 
     // Apply scroll offset
-    let visible_height = area.height.saturating_sub(4) as usize; // borders + header
+    let visible_height = area.height.saturating_sub(3) as usize; // 2 borders + header
+    // Record the view height so key handling can clamp the offset.
+    app.sat_view_rows.set(visible_height);
     let max_offset = sats.len().saturating_sub(visible_height);
     let offset = app.sat_scroll_offset.min(max_offset);
     let visible_sats = &sats[offset..sats.len().min(offset + visible_height)];
@@ -41,22 +43,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(if sat.used { "*" } else { "" })
                     .style(Style::default().fg(Color::Green)),
                 Cell::from(format!("{}", sat.sigid)),
-                Cell::from(if sat.health == 1 {
-                    "OK".to_string()
-                } else {
-                    format!("{}", sat.health)
-                })
-                .style(if sat.health == 1 {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Red)
-                }),
+                health_cell(sat.health),
             ])
         })
         .collect();
 
     let scroll_info = if sats.len() > visible_height {
-        format!(" Satellites [{}-{}/{}] ", offset + 1, (offset + visible_sats.len()).min(sats.len()), sats.len())
+        format!(
+            " Satellites [{}-{}/{}] ",
+            offset + 1,
+            (offset + visible_sats.len()).min(sats.len()),
+            sats.len()
+        )
     } else {
         format!(" Satellites ({}) ", sats.len())
     };
@@ -81,4 +79,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::bordered().title(scroll_info));
 
     f.render_widget(table, area);
+}
+
+/// gpsd health: 0 = unknown, 1 = OK, 2 = unhealthy.
+fn health_cell(health: u8) -> Cell<'static> {
+    match health {
+        0 => Cell::from("---").style(Style::default().fg(Color::DarkGray)),
+        1 => Cell::from("OK").style(Style::default().fg(Color::Green)),
+        2 => Cell::from("BAD").style(Style::default().fg(Color::Red).bold()),
+        n => Cell::from(n.to_string()),
+    }
 }

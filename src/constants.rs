@@ -27,13 +27,35 @@ pub const GNSS_SHORT: &[(u8, &str)] = &[
 pub const GNSS_COLORS: &[(u8, Color)] = &[
     (0, Color::Green),
     (1, Color::Yellow),
-    (2, Color::Blue),
+    // LightBlue rather than Blue: ANSI blue is nearly invisible on black.
+    (2, Color::LightBlue),
     (3, Color::Red),
     (4, Color::Magenta),
     (5, Color::LightCyan),
     (6, Color::Cyan),
     (7, Color::LightMagenta),
 ];
+
+/// Single-letter constellation code (RINEX style) so constellation can be
+/// identified without relying on color alone.
+pub const GNSS_LETTERS: &[(u8, char)] = &[
+    (0, 'G'),
+    (1, 'S'),
+    (2, 'E'),
+    (3, 'C'),
+    (4, 'M'),
+    (5, 'J'),
+    (6, 'R'),
+    (7, 'I'),
+];
+
+pub fn gnss_letter(id: u8) -> char {
+    GNSS_LETTERS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, c)| *c)
+        .unwrap_or('?')
+}
 
 pub fn gnss_name(id: u8) -> &'static str {
     GNSS_NAMES
@@ -56,7 +78,7 @@ pub fn gnss_color(id: u8) -> Color {
         .iter()
         .find(|(i, _)| *i == id)
         .map(|(_, c)| *c)
-        .unwrap_or(Color::White)
+        .unwrap_or(Color::Reset)
 }
 
 pub fn mode_name(mode: FixMode) -> &'static str {
@@ -100,7 +122,7 @@ pub fn status_color(status: FixStatus) -> Color {
         FixStatus::RtkFloat => Color::LightCyan,
         FixStatus::Dr => Color::Yellow,
         FixStatus::GnssDr => Color::Yellow,
-        FixStatus::TimeOnly => Color::Blue,
+        FixStatus::TimeOnly => Color::LightBlue,
         FixStatus::Simulated => Color::Magenta,
         FixStatus::PpsFix => Color::Green,
     }
@@ -120,9 +142,41 @@ pub fn dop_rating(value: f64) -> (&'static str, Color) {
     }
 }
 
+/// Fix ages below this (seconds) are fresh (green).
+pub const FIX_AGE_FRESH_SECS: f64 = 2.0;
+/// Fix ages from this on (seconds) are old (red). Matches the app's
+/// staleness threshold so the age turns red when panels go STALE.
+pub const FIX_AGE_OLD_SECS: f64 = 10.0;
+
+/// Color for the age of the last TPV fix: green below
+/// [`FIX_AGE_FRESH_SECS`], yellow below [`FIX_AGE_OLD_SECS`], red after,
+/// DarkGray before the first fix.
+pub fn fix_age_color(age: Option<f64>) -> Color {
+    match age.filter(|a| a.is_finite()) {
+        None => Color::DarkGray,
+        Some(a) if a < FIX_AGE_FRESH_SECS => Color::Green,
+        Some(a) if a < FIX_AGE_OLD_SECS => Color::Yellow,
+        Some(_) => Color::Red,
+    }
+}
+
+/// Color for a circular error probable radius in meters (thresholds are
+/// in meters regardless of the display unit).
+pub fn cep_color(cep_m: f64) -> Color {
+    if !cep_m.is_finite() {
+        Color::DarkGray
+    } else if cep_m < 1.0 {
+        Color::Green
+    } else if cep_m < 5.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
 pub const COMPASS_POINTS: &[&str] = &[
-    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
-    "NW", "NNW",
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW",
+    "NNW",
 ];
 
 pub fn bearing_to_compass(degrees: f64) -> &'static str {
@@ -153,6 +207,15 @@ mod tests {
     fn test_gnss_short() {
         assert_eq!(gnss_short(0), "GP");
         assert_eq!(gnss_short(3), "BD");
+    }
+
+    #[test]
+    fn test_gnss_letter() {
+        assert_eq!(gnss_letter(0), 'G');
+        assert_eq!(gnss_letter(2), 'E');
+        assert_eq!(gnss_letter(3), 'C');
+        assert_eq!(gnss_letter(6), 'R');
+        assert_eq!(gnss_letter(99), '?');
     }
 
     #[test]
@@ -214,5 +277,26 @@ mod tests {
     #[test]
     fn test_bearing_360() {
         assert_eq!(bearing_to_compass(359.0), "N");
+    }
+
+    #[test]
+    fn test_fix_age_color() {
+        assert_eq!(fix_age_color(None), Color::DarkGray);
+        assert_eq!(fix_age_color(Some(f64::NAN)), Color::DarkGray);
+        assert_eq!(fix_age_color(Some(0.0)), Color::Green);
+        assert_eq!(fix_age_color(Some(1.99)), Color::Green);
+        assert_eq!(fix_age_color(Some(2.0)), Color::Yellow);
+        assert_eq!(fix_age_color(Some(9.99)), Color::Yellow);
+        assert_eq!(fix_age_color(Some(10.0)), Color::Red);
+        assert_eq!(fix_age_color(Some(1e6)), Color::Red);
+    }
+
+    #[test]
+    fn test_cep_color() {
+        assert_eq!(cep_color(0.5), Color::Green);
+        assert_eq!(cep_color(1.0), Color::Yellow);
+        assert_eq!(cep_color(4.99), Color::Yellow);
+        assert_eq!(cep_color(5.0), Color::Red);
+        assert_eq!(cep_color(f64::NAN), Color::DarkGray);
     }
 }

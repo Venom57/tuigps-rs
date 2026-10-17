@@ -1,0 +1,3 @@
+# Fixtures are byte-exact gpsd output; never normalize line endings
+# (crlf.jsonl deliberately uses CRLF).
+* -text

@@ -1,153 +1,186 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{ActiveTab, App};
+use super::constellation_counts;
+use crate::app::{Action, ActiveTab, App, GLOBAL_BINDINGS, KeyBinding, tab_bindings};
 use crate::constants::gnss_short;
 
-pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
-    let data = &app.gps_data;
+/// Columns of key hints we try to keep visible before giving space to the
+/// optional detail text (constellation breakdown / error message).
+const MIN_HINT_WIDTH: usize = 20;
 
+/// Longest error message shown next to the DISCONNECTED badge.
+const MAX_DETAIL_WIDTH: usize = 32;
+
+/// Footer: key hints (or a transient status message) on the left, and a
+/// right-anchored chunk with REC/HOLD and the connection badge. The right
+/// chunk is laid out first so the hints are what gets truncated on narrow
+/// terminals.
+pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
+    let right = Line::from(right_spans(app, area.width as usize));
+    let right_w = (right.width() as u16).min(area.width);
+
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).areas(area);
+
+    f.render_widget(Paragraph::new(Line::from(left_spans(app))), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
+}
+
+fn left_spans(app: &App) -> Vec<Span<'static>> {
+    // A pending device confirmation stays visible until answered.
+    if let Some(confirm) = &app.device_config.confirm {
+        let style = if confirm.destructive() {
+            Style::default().fg(Color::White).bg(Color::Red).bold()
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        };
+        return vec![
+            Span::raw(" "),
+            Span::styled(format!(" {} y/n ", confirm.prompt), style),
+        ];
+    }
+
+    // A transient status message temporarily replaces the hints.
+    if !app.status_message.is_empty() {
+        return vec![Span::styled(
+            format!(" {}", app.status_message),
+            Style::default().fg(Color::Yellow),
+        )];
+    }
+
+    hint_spans(app.active_tab)
+}
+
+/// Key hints generated from the key binding table: `?:help` first, then
+/// the tab's keys (least discoverable), then the global keys.
+fn hint_spans(tab: ActiveTab) -> Vec<Span<'static>> {
+    let key_style = Style::default().fg(Color::Yellow).bold();
+    let sep = || Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray));
+    let hint = |b: &KeyBinding, spans: &mut Vec<Span<'static>>| {
+        if let Some(h) = b.hint {
+            spans.push(Span::styled(b.label, key_style));
+            spans.push(Span::raw(format!(":{} ", h)));
+        }
+    };
+
+    let mut spans = vec![Span::raw(" ")];
+    let (help, globals): (Vec<&KeyBinding>, Vec<&KeyBinding>) = GLOBAL_BINDINGS
+        .iter()
+        .partition(|b| b.action == Action::ToggleHelp);
+    for b in help {
+        hint(b, &mut spans);
+    }
+    spans.push(sep());
+    let tab_bindings = tab_bindings(tab);
+    if tab_bindings.iter().any(|b| b.hint.is_some()) {
+        for b in tab_bindings {
+            hint(b, &mut spans);
+        }
+        spans.push(sep());
+    }
+    for b in globals {
+        hint(b, &mut spans);
+    }
+    spans
+}
+
+fn right_spans(app: &App, total_width: usize) -> Vec<Span<'static>> {
+    let data = &app.gps_data;
     let mut spans = vec![];
 
-    // Global keybindings
-    for (key, action) in &[
-        ("q", "quit"),
-        ("r", "reconnect"),
-        ("s", "settings"),
-        ("u", "units"),
-        ("m", "maps"),
-        ("l", "log"),
-        ("h", "hold"),
-    ] {
-        spans.push(Span::styled(
-            format!(" {} ", key),
-            Style::default().fg(Color::White).bg(Color::DarkGray),
-        ));
-        spans.push(Span::raw(format!("{} ", action)));
-    }
-
-    // Tab-specific keybindings
-    match app.active_tab {
-        ActiveTab::Nmea => {
-            spans.push(Span::raw("| "));
-            for (key, action) in &[
-                ("p", "pause"),
-                ("f", "filter"),
-                ("c", "clear"),
-            ] {
-                spans.push(Span::styled(
-                    format!(" {} ", key),
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-                ));
-                spans.push(Span::raw(format!("{} ", action)));
-            }
-        }
-        ActiveTab::Timing => {
-            spans.push(Span::raw("| "));
-            for (key, action) in &[
-                ("a", "arm"),
-                ("c", "clear"),
-                ("k", "clock"),
-            ] {
-                spans.push(Span::styled(
-                    format!(" {} ", key),
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-                ));
-                spans.push(Span::raw(format!("{} ", action)));
-            }
-        }
-        ActiveTab::Satellites => {
-            spans.push(Span::raw("| "));
-            spans.push(Span::styled(
-                " \u{2191}\u{2193} ",
-                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-            ));
-            spans.push(Span::raw("scroll "));
-        }
-        ActiveTab::Device => {
-            spans.push(Span::raw("| "));
-            spans.push(Span::styled(
-                " \u{2191}\u{2193} ",
-                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-            ));
-            spans.push(Span::raw("select "));
-            spans.push(Span::styled(
-                " \u{2190}\u{2192} ",
-                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-            ));
-            spans.push(Span::raw("adjust "));
-            spans.push(Span::styled(
-                " \u{23ce} ",
-                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-            ));
-            spans.push(Span::raw("apply "));
-        }
-        _ => {}
-    }
-
-    // Status message (visible on all tabs)
-    if !app.status_message.is_empty() {
-        spans.push(Span::styled(
-            format!(" {} ", app.status_message),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
-    // Activity badges
-    if app.logger.as_ref().is_some_and(|l| l.active) {
+    if let Some(points) = app.log_points() {
         spans.push(Span::styled(
             " REC ",
-            Style::default().fg(Color::White).bg(Color::Red),
+            Style::default().fg(Color::White).bg(Color::Red).bold(),
         ));
-        spans.push(Span::raw(format!(
-            " {} pts ",
-            app.logger.as_ref().unwrap().point_count
-        )));
+        let formats: Vec<&str> = app.loggers.iter().map(|l| l.format().label()).collect();
+        spans.push(Span::raw(format!(" {} {} pts ", formats.join("+"), points)));
     }
     if app.position_hold.is_some() {
         spans.push(Span::styled(
             " HOLD ",
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
         ));
         spans.push(Span::raw(" "));
     }
 
-    // Connection status with staleness and constellation breakdown
-    if !data.connected {
-        spans.push(Span::styled(
-            " DISCONNECTED ",
-            Style::default().fg(Color::White).bg(Color::Red),
-        ));
-        if !data.error_message.is_empty() {
-            spans.push(Span::raw(format!(" {} ", data.error_message)));
-        }
+    let (badge, detail) = if !data.connected {
+        (
+            Span::styled(
+                " DISCONNECTED ",
+                Style::default().fg(Color::White).bg(Color::Red).bold(),
+            ),
+            data.error_message.clone(),
+        )
     } else if app.stale {
-        spans.push(Span::styled(
-            format!(" STALE ({:.0}s) ", app.stale_seconds),
-            Style::default().fg(Color::White).bg(Color::Yellow),
-        ));
+        (
+            Span::styled(
+                format!(" STALE ({:.0}s) ", app.stale_seconds),
+                Style::default().fg(Color::Black).bg(Color::Yellow).bold(),
+            ),
+            String::new(),
+        )
     } else {
-        spans.push(Span::styled(
-            " CONNECTED ",
-            Style::default().fg(Color::Black).bg(Color::Green),
-        ));
+        (
+            Span::styled(
+                " CONNECTED ",
+                Style::default().fg(Color::Black).bg(Color::Green).bold(),
+            ),
+            used_breakdown(app),
+        )
+    };
+    spans.push(badge);
 
-        // Constellation breakdown
-        let counts = data.constellation_counts();
-        if !counts.is_empty() {
-            let mut parts: Vec<(u8, u32, u32)> =
-                counts.into_iter().map(|(id, (v, u))| (id, v, u)).collect();
-            parts.sort_by_key(|(id, _, _)| *id);
-            let breakdown: Vec<String> = parts
-                .iter()
-                .filter(|(_, _, u)| *u > 0)
-                .map(|(id, _, u)| format!("{}{}", u, gnss_short(*id)))
-                .collect();
-            if !breakdown.is_empty() {
-                spans.push(Span::raw(format!(" {} ", breakdown.join("+"))));
-            }
-        }
+    // Optional detail text only gets space left over after the badges and
+    // a minimum amount of hints.
+    let used: usize = spans.iter().map(Span::width).sum();
+    let budget = total_width
+        .saturating_sub(used + MIN_HINT_WIDTH + 2)
+        .min(MAX_DETAIL_WIDTH);
+    if !detail.is_empty() && budget > 0 {
+        spans.push(Span::raw(format!(" {} ", truncate(&detail, budget))));
     }
 
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans
+}
+
+/// e.g. "8GP+5GA+4GL" — satellites used per constellation.
+fn used_breakdown(app: &App) -> String {
+    let counts = constellation_counts(&app.gps_data.satellites);
+    let mut out = String::new();
+    for (id, &(_, used)) in counts.iter().enumerate() {
+        if used > 0 {
+            if !out.is_empty() {
+                out.push('+');
+            }
+            out.push_str(&format!("{}{}", used, gnss_short(id as u8)));
+        }
+    }
+    out
+}
+
+/// Truncate to at most `max` chars, marking the cut with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('\u{2026}');
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_and_long() {
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 4), "abc\u{2026}");
+        assert_eq!(truncate("abc", 0), "");
+    }
 }
