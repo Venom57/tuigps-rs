@@ -327,8 +327,10 @@ fn extract_sky(msg: &Value, data: &mut GPSData) {
 
     // An explicit (possibly empty) array replaces the list; absent keeps it.
     if let Some(sats) = msg["satellites"].as_array() {
+        // Non-object entries are skipped rather than turned into PRN 0.
         data.satellites = sats
             .iter()
+            .filter(|s| s.is_object())
             .map(|s| SatelliteInfo {
                 prn: json_int(s, "PRN").unwrap_or(0),
                 gnssid: json_int(s, "gnssid").unwrap_or(0),
@@ -531,6 +533,19 @@ mod tests {
         apply_line(r#"{"class":"SKY","satellites":[]}"#, &mut data, 2.0);
         assert!(data.satellites.is_empty());
         assert_eq!(data.satellites_used, 0);
+    }
+
+    #[test]
+    fn test_non_object_satellite_entries_skipped() {
+        let mut data = GPSData::default();
+        apply_line(
+            r#"{"class":"SKY","satellites":[1,"x",null,[],{"PRN":9,"used":true}]}"#,
+            &mut data,
+            1.0,
+        );
+        assert_eq!(data.satellites.len(), 1);
+        assert_eq!(data.satellites[0].prn, 9);
+        assert_eq!(data.satellites_used, 1);
     }
 
     #[test]
