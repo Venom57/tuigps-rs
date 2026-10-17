@@ -68,3 +68,5 @@ tempfile = "3"
 quick-xml = "0.42"
 csv = "1"
 proptest = "1"
+# Paused/auto-advancing clock for the reconnect-delay tests
+tokio = { version = "1", features = ["test-util"] }
