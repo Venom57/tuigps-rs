@@ -255,7 +255,7 @@ fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let is_armed = app.armed_toff;
+    let is_armed = app.timing.armed_toff;
 
     let key_style = Style::default().fg(Color::White).bg(Color::DarkGray);
 
@@ -273,7 +273,7 @@ fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" c ", key_style),
         Span::raw(" clear TOFF  "),
         Span::styled(" k ", key_style),
-        if app.armed_clock_set {
+        if app.timing.armed_clock_set {
             Span::styled(" ARMED ", Style::default().fg(Color::White).bg(Color::Red))
         } else {
             Span::raw(" clock sync  ")

@@ -95,8 +95,8 @@ fn fixture_session_through_app() {
     assert_eq!(d.device.path, "/dev/ttyACM0");
     assert_eq!(d.pps.precision, -20);
     // One TOFF sample per new TPV time
-    assert_eq!(d.toff_samples.len(), 2);
-    assert!(d.toff_samples.iter().all(|s| s.is_finite()));
+    assert_eq!(app.timing.toff_samples.len(), 2);
+    assert!(app.timing.toff_samples.iter().all(|s| s.is_finite()));
     assert_eq!(app.nmea_buffer.len(), 3);
     assert!(app.nmea_buffer[0].starts_with("$GNRMC,140501.00"));
     assert!(!app.stale);
@@ -403,13 +403,13 @@ fn clock_sync_fires_only_on_fresh_tpv_with_fix() {
     app.handle_tagged_event((0, GpsdEvent::Connected));
     app.active_tab = ActiveTab::Timing;
     app.handle_event(key('k'));
-    assert!(app.armed_clock_set);
+    assert!(app.timing.armed_clock_set);
 
     // Non-TPV traffic and a no-fix TPV do not fire
     send(&mut app, PPS, T0);
     send(&mut app, SKY, T0);
     send(&mut app, &tpv_nofix("2024-05-12T14:05:01Z"), T0 + 1.0);
-    assert!(app.armed_clock_set && app.pending_clock_sync.is_none());
+    assert!(app.timing.armed_clock_set && app.pending_clock_sync.is_none());
 
     // A fix whose time equals the previous TPV time is not fresh
     send(
@@ -417,13 +417,13 @@ fn clock_sync_fires_only_on_fresh_tpv_with_fix() {
         &tpv_fix("2024-05-12T14:05:01Z", 1.0, 2.0),
         T0 + 1.5,
     );
-    assert!(app.armed_clock_set && app.pending_clock_sync.is_none());
+    assert!(app.timing.armed_clock_set && app.pending_clock_sync.is_none());
 
     // An old-generation TPV cannot fire it either
     app.begin_reconnect();
     let old = GpsdMessage::parse(&tpv_fix("2024-05-12T14:05:02Z", 1.0, 2.0), T0 + 2.0).unwrap();
     assert!(!app.handle_tagged_event((0, GpsdEvent::Message(old))));
-    assert!(app.armed_clock_set && app.pending_clock_sync.is_none());
+    assert!(app.timing.armed_clock_set && app.pending_clock_sync.is_none());
     app.handle_tagged_event((1, GpsdEvent::Connected));
 
     // Fresh TPV with a fix: queued exactly once, single-shot
@@ -432,7 +432,7 @@ fn clock_sync_fires_only_on_fresh_tpv_with_fix() {
         &tpv_fix("2024-05-12T14:05:03.250Z", 1.0, 2.0),
         T0 + 3.3,
     );
-    assert!(!app.armed_clock_set);
+    assert!(!app.timing.armed_clock_set);
     let expected = ClockSyncRequest {
         gps_time: "2024-05-12T14:05:03.250Z".into(),
         tpv_receipt: T0 + 3.3,
@@ -457,9 +457,9 @@ fn clock_sync_fires_only_on_fresh_tpv_with_fix() {
 
     // Disarm before a fix arrives: nothing is queued
     app.handle_event(key('k'));
-    assert!(app.armed_clock_set);
+    assert!(app.timing.armed_clock_set);
     app.handle_event(key('k'));
-    assert!(!app.armed_clock_set);
+    assert!(!app.timing.armed_clock_set);
     send(
         &mut app,
         &tpv_fix("2024-05-12T14:05:05Z", 1.0, 2.0),

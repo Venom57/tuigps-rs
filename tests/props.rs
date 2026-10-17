@@ -11,7 +11,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::{Map, Number, Value};
 
-use tuigps_rs::app::{ActiveTab, App};
+use tuigps_rs::app::{ActiveTab, App, TimingState};
 use tuigps_rs::data_model::GPSData;
 use tuigps_rs::gpsd_client::{GpsdEvent, GpsdMessage, classify_line};
 use tuigps_rs::position_hold::PositionHold;
@@ -239,14 +239,11 @@ fn assert_no_infinities(d: &GPSData) {
         ("sep", d.errors.sep),
         ("cycle", d.device.cycle),
         ("mincycle", d.device.mincycle),
-        ("toff_armed_offset", d.toff_armed_offset),
-        ("toff_armed_sys_time", d.toff_armed_sys_time),
         ("pps_offset_us", d.pps_offset_us()),
     ];
     for s in &d.satellites {
         values.extend([("el", s.elevation), ("az", s.azimuth), ("ss", s.snr)]);
     }
-    values.extend(d.toff_samples.iter().map(|&t| ("toff_sample", t)));
     for (name, v) in values {
         assert!(!v.is_infinite(), "{name} is {v}");
     }
@@ -256,6 +253,18 @@ fn assert_no_infinities(d: &GPSData) {
     );
     if d.has_fix() {
         assert!(d.latitude.is_finite() && d.longitude.is_finite());
+    }
+}
+
+/// The app-managed TOFF values: NaN means "none", but never infinite.
+fn assert_timing_no_infinities(t: &TimingState) {
+    let mut values = vec![
+        ("toff_armed_offset", t.toff_armed_offset),
+        ("toff_armed_sys_time", t.toff_armed_sys_time),
+    ];
+    values.extend(t.toff_samples.iter().map(|&v| ("toff_sample", v)));
+    for (name, v) in values {
+        assert!(!v.is_infinite(), "{name} is {v}");
     }
 }
 
@@ -330,8 +339,8 @@ proptest! {
         armed in any::<bool>(),
     ) {
         let mut app = populated_app();
-        app.armed_clock_set = armed;
-        app.armed_toff = true;
+        app.timing.armed_clock_set = armed;
+        app.timing.armed_toff = true;
         app.position_hold = Some(PositionHold::new());
         for (i, obj) in objs.iter().enumerate() {
             if let Some(event) = classify_line(&obj.to_string(), 1_715_522_702.0 + i as f64) {
@@ -339,6 +348,7 @@ proptest! {
             }
         }
         assert_no_infinities(&app.gps_data);
+        assert_timing_no_infinities(&app.timing);
         app.update_staleness(1_715_522_720.0);
         for &tab in ActiveTab::ALL {
             app.active_tab = tab;

@@ -7,6 +7,7 @@ use crate::formatting::{fmt, fmt_offset, fmt_time_iso, panel_title, plus_minus};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
     let data = &app.gps_data;
+    let timing = &app.timing;
     let (date, time) = fmt_time_iso(&data.time);
 
     let mut lines = vec![
@@ -46,12 +47,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         ]));
 
         // TOFF stats
-        if !data.toff_samples.is_empty() {
-            if let Some((mean, std, min, max)) = toff_stats(&data.toff_samples) {
+        if !timing.toff_samples.is_empty() {
+            if let Some((mean, std, min, max)) = toff_stats(&timing.toff_samples) {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
                     Span::styled("TOFF ", Style::default().bold()),
-                    Span::raw(format!("({} samples)", data.toff_samples.len())),
+                    Span::raw(format!("({} samples)", timing.toff_samples.len())),
                 ]));
                 lines.push(Line::from(format!("  Mean: {}", fmt_offset(mean))));
                 lines.push(Line::from(format!("  Std:  {}", fmt_offset(std))));
@@ -67,7 +68,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         }
 
         // Armed TOFF state
-        let is_armed = app.armed_toff;
+        let is_armed = timing.armed_toff;
         if is_armed {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
@@ -80,19 +81,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
-        } else if data.toff_armed_offset.is_finite() {
+        } else if timing.toff_armed_offset.is_finite() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::styled("Armed TOFF: ", Style::default().fg(Color::Green).bold()),
                 Span::styled(
-                    fmt_offset(data.toff_armed_offset),
+                    fmt_offset(timing.toff_armed_offset),
                     Style::default().fg(Color::Green).bold(),
                 ),
             ]));
-            if !data.toff_armed_gps_time.is_empty() {
+            if !timing.toff_armed_gps_time.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw("  GPS time: "),
-                    Span::raw(&data.toff_armed_gps_time),
+                    Span::raw(&timing.toff_armed_gps_time),
                 ]));
             }
         }
