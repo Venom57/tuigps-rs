@@ -297,7 +297,7 @@ impl App {
         }
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
+    pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = msg.into();
         self.status_message_tick = 5; // show for 5 ticks (seconds)
     }
@@ -411,8 +411,11 @@ impl App {
                 }
 
                 // Log if active
-                if let Some(ref mut logger) = self.logger {
-                    let _ = logger.log_point(&self.gps_data);
+                if let Some(ref mut logger) = self.logger
+                    && let Err(e) = logger.log_point(&self.gps_data)
+                {
+                    let msg = format!("Log write error: {}", e);
+                    self.set_status(msg);
                 }
 
                 // Position hold
@@ -485,35 +488,65 @@ impl App {
         self.units = self.units.next();
     }
 
-    fn open_maps(&self) {
-        if self.gps_data.has_fix() {
-            let url = format!(
+    fn maps_url(&self) -> Option<String> {
+        self.gps_data.has_fix().then(|| {
+            format!(
                 "https://www.google.com/maps?q={},{}",
                 self.gps_data.latitude, self.gps_data.longitude
-            );
-            let _ = open::that(url);
+            )
+        })
+    }
+
+    fn open_maps(&mut self) {
+        match self.maps_url() {
+            None => self.set_status("No fix: cannot open map"),
+            Some(url) => match open::that(&url) {
+                Ok(()) => self.set_status("Opened map in browser"),
+                Err(e) => self.set_status(format!("Failed to open browser: {}", e)),
+            },
         }
     }
 
     fn toggle_logging(&mut self) {
-        if let Some(ref mut logger) = self.logger {
-            if logger.active {
-                let _ = logger.stop();
-                self.logger = None;
-            }
+        if self.logger.is_some() {
+            self.stop_logging();
         } else {
             let mut logger = GpsLogger::new(LogFormat::Gpx, &self.log_dir);
-            if logger.start().is_ok() {
-                self.logger = Some(logger);
+            match logger.start() {
+                Ok(()) => {
+                    self.set_status(format!("Logging to {}", logger.filename));
+                    self.logger = Some(logger);
+                }
+                Err(e) => self.set_status(format!("Failed to start logging: {}", e)),
+            }
+        }
+    }
+
+    /// Stop and close the active log (if any), reporting the result.
+    pub fn stop_logging(&mut self) {
+        if let Some(mut logger) = self.logger.take() {
+            match logger.stop() {
+                Ok(()) => self.set_status(format!(
+                    "Logging stopped: {} points written to {}",
+                    logger.point_count, logger.filename
+                )),
+                Err(e) => self.set_status(format!("Error closing log {}: {}", logger.filename, e)),
             }
         }
     }
 
     fn toggle_hold(&mut self) {
-        if self.position_hold.is_some() {
-            self.position_hold = None;
+        if let Some(hold) = self.position_hold.take() {
+            match hold.result() {
+                Some(r) => self.set_status(format!(
+                    "Hold stopped: {} fixes, mean {:.7}, {:.7}",
+                    r.count, r.mean_lat, r.mean_lon
+                )),
+                None => self.set_status("Hold stopped (fewer than 2 fixes)"),
+            }
         } else {
             self.position_hold = Some(PositionHold::new());
+            self.set_status("Position hold started");
         }
     }
 
@@ -980,17 +1013,26 @@ fn build_tp5_cmd(freq_hz: u32, pulse_us: u32, active: bool) -> String {
     parts.join(",")
 }
 
+/// Consecutive terminal input errors tolerated before giving up.
+const MAX_INPUT_ERRORS: u32 = 20;
+
 pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
     let mut app = App::new(host.to_string(), port);
+    let result = event_loop(terminal, &mut app).await;
+    // Always close the log so the GPX file is valid, even on error.
+    app.stop_logging();
+    result
+}
 
+async fn event_loop(terminal: &mut Terminal<impl Backend>, app: &mut App) -> Result<()> {
     // Channel for gpsd events
     let (tx, mut rx) = mpsc::channel(100);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Spawn gpsd task
     let mut gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
-        host.to_string(),
-        port,
+        app.host.clone(),
+        app.port,
         tx.clone(),
         shutdown_rx.clone(),
     ));
@@ -998,12 +1040,28 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
     // Event stream
     let mut event_reader = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut input_errors = 0u32;
 
-    loop {
+    let result = loop {
         tokio::select! {
-            Some(Ok(event)) = event_reader.next() => {
-                app.handle_event(event);
-            }
+            event = event_reader.next() => match event {
+                Some(Ok(event)) => {
+                    input_errors = 0;
+                    app.handle_event(event);
+                }
+                Some(Err(e)) => {
+                    input_errors += 1;
+                    if input_errors >= MAX_INPUT_ERRORS {
+                        // Input is unusable; quit rather than spin unquittable.
+                        break Err(anyhow::anyhow!("terminal input failed: {}", e));
+                    }
+                    app.set_status(format!("Terminal input error: {}", e));
+                }
+                None => {
+                    // Input stream ended: no way to receive 'q', so quit.
+                    app.should_quit = true;
+                }
+            },
             Some(gpsd_event) = rx.recv() => {
                 app.handle_gpsd_event(gpsd_event);
             }
@@ -1042,16 +1100,18 @@ pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -
             ));
         }
 
-        terminal.draw(|f| ui::render(f, &app))?;
-
         if app.should_quit {
-            let _ = shutdown_tx.send(true);
-            break;
+            break Ok(());
         }
-    }
 
+        if let Err(e) = terminal.draw(|f| ui::render(f, app)) {
+            break Err(e.into());
+        }
+    };
+
+    let _ = shutdown_tx.send(true);
     gpsd_handle.abort();
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -1768,5 +1828,71 @@ mod tests {
             dc.output_log.last().unwrap(),
             &format!("line {}", OUTPUT_LOG_MAX + 49)
         );
+    }
+
+    #[test]
+    fn test_logging_status_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(app.status_message.starts_with("Logging to "));
+        assert!(app.status_message.contains("tuigps_"));
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(
+            app.status_message.contains("0 points"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn test_logging_start_failure_reported() {
+        let mut app = new_app();
+        app.log_dir = PathBuf::from("/nonexistent/definitely/not/here");
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(app.logger.is_none());
+        assert!(app.status_message.contains("Failed to start logging"));
+    }
+
+    #[test]
+    fn test_stop_logging_on_quit_closes_gpx() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
+        app.handle_event(key_event(KeyCode::Char('l')));
+        let filename = app.logger.as_ref().unwrap().filename.clone();
+        app.handle_event(key_event(KeyCode::Char('q')));
+        assert!(app.should_quit);
+        // What run() does after the loop exits
+        app.stop_logging();
+        assert!(app.logger.is_none());
+        let contents = std::fs::read_to_string(&filename).unwrap();
+        assert!(contents.trim_end().ends_with("</gpx>"));
+    }
+
+    #[test]
+    fn test_maps_without_fix_reports() {
+        let mut app = new_app();
+        assert!(app.maps_url().is_none());
+        app.handle_event(key_event(KeyCode::Char('m')));
+        assert!(app.status_message.contains("No fix"));
+
+        app.gps_data.mode = crate::data_model::FixMode::Fix3D;
+        app.gps_data.latitude = 51.5;
+        app.gps_data.longitude = -0.1;
+        assert_eq!(
+            app.maps_url().as_deref(),
+            Some("https://www.google.com/maps?q=51.5,-0.1")
+        );
+    }
+
+    #[test]
+    fn test_hold_toggle_feedback() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(app.status_message.contains("started"));
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(app.status_message.contains("fewer than 2"));
     }
 }
