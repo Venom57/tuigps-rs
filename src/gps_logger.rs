@@ -11,6 +11,7 @@
 //!   finalizes the file (closing GPX tags + flush).
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -24,27 +25,108 @@ pub enum LogFormat {
 }
 
 impl LogFormat {
-    fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             LogFormat::Gpx => "gpx",
             LogFormat::Csv => "csv",
         }
     }
+
+    /// Upper-case name for the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogFormat::Gpx => "GPX",
+            LogFormat::Csv => "CSV",
+        }
+    }
 }
 
-/// CSV header row. Kept stable so downstream tooling can rely on it.
+/// Which log file(s) the `l` key writes. Persisted as `log_format` in the
+/// config file (`"gpx"`, `"csv"` or `"both"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogMode {
+    #[default]
+    Gpx,
+    Csv,
+    /// GPX and CSV side by side, sharing one filename stem.
+    Both,
+}
+
+impl LogMode {
+    pub const ALL: [LogMode; 3] = [LogMode::Gpx, LogMode::Csv, LogMode::Both];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogMode::Gpx => "gpx",
+            LogMode::Csv => "csv",
+            LogMode::Both => "both",
+        }
+    }
+
+    /// Short label for the UI, e.g. `GPX+CSV`.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogMode::Gpx => "GPX",
+            LogMode::Csv => "CSV",
+            LogMode::Both => "GPX+CSV",
+        }
+    }
+
+    /// The file formats this mode writes, in a fixed order.
+    pub fn formats(self) -> &'static [LogFormat] {
+        match self {
+            LogMode::Gpx => &[LogFormat::Gpx],
+            LogMode::Csv => &[LogFormat::Csv],
+            LogMode::Both => &[LogFormat::Gpx, LogFormat::Csv],
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            LogMode::Gpx => LogMode::Csv,
+            LogMode::Csv => LogMode::Both,
+            LogMode::Both => LogMode::Gpx,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        self.next().next()
+    }
+}
+
+impl std::str::FromStr for LogMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        LogMode::ALL
+            .into_iter()
+            .find(|m| m.as_str().eq_ignore_ascii_case(s))
+            .ok_or_else(|| format!("unknown log format '{s}' (expected gpx, csv or both)"))
+    }
+}
+
+/// CSV header row. Columns are only ever appended, so tooling that reads
+/// the leading columns keeps working.
 ///
-/// Columns:
+/// Columns (always SI units, independent of the display unit setting):
 /// - `time`: gpsd TPV time, ISO 8601 UTC (e.g. `2024-01-15T12:30:00.000Z`)
 /// - `latitude`, `longitude`: WGS84 decimal degrees
 /// - `alt_msl`: altitude above mean sea level, meters
 /// - `speed`: ground speed, m/s
 /// - `track`: course over ground, degrees true
 /// - `climb`: vertical speed, m/s
+/// - `alt_hae`: altitude above the WGS84 ellipsoid, meters
+/// - `mode`: fix mode, `2d` or `3d`
+/// - `status`: gpsd fix status (`gps`, `dgps`, `rtk_fix`, `rtk_float`, ...)
+/// - `sats_used`, `sats_visible`: satellite counts
+/// - `hdop`, `vdop`, `pdop`: dilution of precision
+/// - `eph`, `epv`: estimated horizontal / vertical error, meters
 ///
 /// Values gpsd did not report (NaN/inf internally) are written as empty
 /// fields, never as `NaN`.
-pub const CSV_HEADER: &str = "time,latitude,longitude,alt_msl,speed,track,climb";
+pub const CSV_HEADER: &str = "time,latitude,longitude,alt_msl,speed,track,climb,\
+alt_hae,mode,status,sats_used,sats_visible,hdop,vdop,pdop,eph,epv";
 
 /// Highest numeric suffix tried before giving up on finding a free filename.
 const MAX_COLLISION_SUFFIX: u32 = 9999;
@@ -80,11 +162,19 @@ impl GpsLogger {
     /// Open a new, uniquely named log file in the output directory and write
     /// its header. If a log is already open it is finalized first.
     pub fn start(&mut self) -> Result<()> {
+        self.start_named(&session_stem())
+    }
+
+    /// Like [`start`](Self::start) with an explicit filename stem, so the
+    /// GPX and CSV files of one session can share a name.
+    pub fn start_named(&mut self, stem: &str) -> Result<()> {
         if self.active {
             self.stop()?;
         }
-        let stem = format!("tuigps_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-        let (path, file) = create_unique(&self.dir, &stem, self.format.extension())?;
+        if !self.dir.is_dir() {
+            bail!("log directory {} does not exist", self.dir.display());
+        }
+        let (path, file) = create_unique(&self.dir, stem, self.format.extension())?;
         let mut file = BufWriter::new(file);
         match self.format {
             LogFormat::Gpx => write_gpx_header(&mut file)?,
@@ -144,6 +234,11 @@ impl Drop for GpsLogger {
         // Best effort: there is nowhere to report an error from Drop.
         let _ = self.stop();
     }
+}
+
+/// Default filename stem for a logging session: `tuigps_YYYYMMDD_HHMMSS`.
+pub fn session_stem() -> String {
+    format!("tuigps_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"))
 }
 
 /// Create `<dir>/<stem>.<ext>`, or `<stem>_N.<ext>` for the smallest N >= 1
@@ -229,9 +324,14 @@ fn gpx_fix(data: &GPSData) -> Option<&'static str> {
 }
 
 fn write_csv_point(w: &mut impl Write, data: &GPSData) -> std::io::Result<()> {
+    let mode = match data.mode {
+        FixMode::Fix2D => "2d",
+        FixMode::Fix3D => "3d",
+        _ => "",
+    };
     writeln!(
         w,
-        "{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_escape(&data.time),
         csv_num(data.latitude),
         csv_num(data.longitude),
@@ -239,7 +339,33 @@ fn write_csv_point(w: &mut impl Write, data: &GPSData) -> std::io::Result<()> {
         csv_num(data.speed),
         csv_num(data.track),
         csv_num(data.climb),
+        csv_num(data.alt_hae),
+        mode,
+        csv_status(data.status),
+        data.satellites_used,
+        data.satellites.len(),
+        csv_num(data.dop.hdop),
+        csv_num(data.dop.vdop),
+        csv_num(data.dop.pdop),
+        csv_num(data.errors.eph),
+        csv_num(data.errors.epv),
     )
+}
+
+/// gpsd fix status as a stable lowercase token (empty when unknown).
+fn csv_status(status: FixStatus) -> &'static str {
+    match status {
+        FixStatus::Unknown => "",
+        FixStatus::Gps => "gps",
+        FixStatus::Dgps => "dgps",
+        FixStatus::RtkFix => "rtk_fix",
+        FixStatus::RtkFloat => "rtk_float",
+        FixStatus::Dr => "dr",
+        FixStatus::GnssDr => "gnss_dr",
+        FixStatus::TimeOnly => "time_only",
+        FixStatus::Simulated => "simulated",
+        FixStatus::PpsFix => "pps",
+    }
 }
 
 /// Format a number for CSV; non-finite values become an empty field.

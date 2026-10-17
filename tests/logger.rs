@@ -6,8 +6,8 @@ use std::path::Path;
 use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use quick_xml::events::Event;
-use tuigps_rs::data_model::{DOPValues, FixMode, GPSData};
-use tuigps_rs::gps_logger::{CSV_HEADER, GpsLogger, LogFormat};
+use tuigps_rs::data_model::{DOPValues, FixMode, FixStatus, GPSData, SatelliteInfo};
+use tuigps_rs::gps_logger::{CSV_HEADER, GpsLogger, LogFormat, LogMode};
 
 fn fix(time: &str, lat: f64, lon: f64) -> GPSData {
     GPSData {
@@ -328,8 +328,12 @@ fn csv_header_rows_and_no_nan() {
     assert_eq!(headers.join(","), CSV_HEADER);
     let rows: Vec<csv::StringRecord> = rdr.records().map(Result::unwrap).collect();
     assert_eq!(rows.len(), 3);
+    // The leading seven columns are a stable prefix; later ones are appended
+    fn prefix(r: &csv::StringRecord) -> Vec<&str> {
+        r.iter().take(7).collect()
+    }
     assert_eq!(
-        rows[0].iter().collect::<Vec<_>>(),
+        prefix(&rows[0]),
         [
             "2024-01-15T12:00:00Z",
             "51.5",
@@ -341,9 +345,92 @@ fn csv_header_rows_and_no_nan() {
         ]
     );
     assert_eq!(
-        rows[1].iter().collect::<Vec<_>>(),
+        prefix(&rows[1]),
         ["2024-01-15T12:00:01Z", "51.5", "-0.1", "", "", "", ""]
     );
+}
+
+#[test]
+fn csv_extended_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut logger = GpsLogger::new(LogFormat::Csv, dir.path());
+    logger.start().unwrap();
+
+    let mut d = fix("2024-01-15T12:00:00Z", 51.5, -0.1);
+    d.alt_hae = 58.0;
+    d.status = FixStatus::Dgps;
+    let sat = SatelliteInfo {
+        prn: 1,
+        gnssid: 0,
+        svid: 1,
+        elevation: 45.0,
+        azimuth: 90.0,
+        snr: 40.0,
+        used: true,
+        sigid: 0,
+        health: 1,
+        freqid: None,
+    };
+    d.satellites = vec![sat; 12];
+    d.dop.vdop = 1.4;
+    d.errors.eph = 2.5;
+    logger.log_point(&d).unwrap();
+    d.time = "2024-01-15T12:00:01Z".into();
+    d.mode = FixMode::Fix2D;
+    d.status = FixStatus::Unknown;
+    logger.log_point(&d).unwrap();
+    logger.stop().unwrap();
+
+    let mut rdr = csv::Reader::from_path(&logger.filename).unwrap();
+    let headers = rdr.headers().unwrap().clone();
+    let rows: Vec<csv::StringRecord> = rdr.records().map(Result::unwrap).collect();
+    let col = |row: usize, name: &str| {
+        let i = headers.iter().position(|h| h == name).unwrap();
+        rows[row].get(i).unwrap().to_string()
+    };
+    assert_eq!(headers.len(), CSV_HEADER.split(',').count());
+    assert!(rows.iter().all(|r| r.len() == headers.len()));
+    assert_eq!(col(0, "alt_hae"), "58");
+    assert_eq!(col(0, "mode"), "3d");
+    assert_eq!(col(0, "status"), "dgps");
+    assert_eq!(col(0, "sats_used"), "9");
+    assert_eq!(col(0, "sats_visible"), "12");
+    assert_eq!(col(0, "hdop"), "0.9");
+    assert_eq!(col(0, "vdop"), "1.4");
+    assert_eq!(col(0, "pdop"), "", "unreported DOP is an empty field");
+    assert_eq!(col(0, "eph"), "2.5");
+    assert_eq!(col(1, "mode"), "2d");
+    assert_eq!(col(1, "status"), "");
+}
+
+#[test]
+fn start_named_shares_stem_and_rejects_missing_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gpx = GpsLogger::new(LogFormat::Gpx, dir.path());
+    let mut csv = GpsLogger::new(LogFormat::Csv, dir.path());
+    gpx.start_named("session").unwrap();
+    csv.start_named("session").unwrap();
+    assert!(gpx.filename.ends_with("session.gpx"));
+    assert!(csv.filename.ends_with("session.csv"));
+
+    let mut missing = GpsLogger::new(LogFormat::Csv, dir.path().join("nope"));
+    let err = missing.start().unwrap_err().to_string();
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(!missing.active);
+}
+
+#[test]
+fn log_mode_formats_and_parsing() {
+    assert_eq!(LogMode::Gpx.formats(), [LogFormat::Gpx]);
+    assert_eq!(LogMode::Csv.formats(), [LogFormat::Csv]);
+    assert_eq!(LogMode::Both.formats(), [LogFormat::Gpx, LogFormat::Csv]);
+    for m in LogMode::ALL {
+        assert_eq!(m.as_str().parse::<LogMode>(), Ok(m));
+        assert_eq!(m.next().prev(), m);
+    }
+    assert_eq!("BOTH".parse::<LogMode>(), Ok(LogMode::Both));
+    assert!("kml".parse::<LogMode>().is_err());
+    assert_eq!(LogMode::default(), LogMode::Gpx);
 }
 
 #[test]
