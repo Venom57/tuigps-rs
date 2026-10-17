@@ -100,8 +100,7 @@ fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    use std::sync::atomic::Ordering;
-    let is_armed = app.armed_toff.load(Ordering::Relaxed);
+    let is_armed = app.armed_toff;
 
     let mut spans = vec![
         Span::styled(" a ", Style::default().fg(Color::White).bg(Color::DarkGray)),

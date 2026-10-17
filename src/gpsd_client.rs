@@ -1,32 +1,136 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::data_model::*;
 
+/// Maximum accepted length of a single gpsd line. Longer lines are discarded.
+pub const MAX_LINE_LEN: usize = 64 * 1024;
+
+/// Delay between reconnection attempts.
+pub const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// gpsd JSON message class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgClass {
+    Tpv,
+    Sky,
+    Pps,
+    Toff,
+    Devices,
+    Device,
+    Version,
+    Watch,
+    Error,
+    Other,
+}
+
+impl MsgClass {
+    pub fn from_class_str(class: &str) -> Self {
+        match class {
+            "TPV" => MsgClass::Tpv,
+            "SKY" => MsgClass::Sky,
+            "PPS" => MsgClass::Pps,
+            "TOFF" => MsgClass::Toff,
+            "DEVICES" => MsgClass::Devices,
+            "DEVICE" => MsgClass::Device,
+            "VERSION" => MsgClass::Version,
+            "WATCH" => MsgClass::Watch,
+            "ERROR" => MsgClass::Error,
+            _ => MsgClass::Other,
+        }
+    }
+}
+
+/// One parsed gpsd JSON message, tagged with its class and the local time at
+/// which it was received. The app applies it to its own `GPSData`, so the
+/// client never has to clone the whole state per line.
+#[derive(Debug, Clone)]
+pub struct GpsdMessage {
+    pub class: MsgClass,
+    pub json: Value,
+    pub receipt_time: f64,
+}
+
+impl GpsdMessage {
+    /// Parse a gpsd JSON line. Returns `None` for invalid JSON and for
+    /// message classes we do not handle, so nothing is sent for them.
+    pub fn parse(line: &str, receipt_time: f64) -> Option<Self> {
+        let json: Value = serde_json::from_str(line).ok()?;
+        let class = MsgClass::from_class_str(json["class"].as_str()?);
+        if class == MsgClass::Other {
+            return None;
+        }
+        Some(Self {
+            class,
+            json,
+            receipt_time,
+        })
+    }
+
+    /// Apply this message to `data`, updating only what the message carries.
+    pub fn apply(&self, data: &mut GPSData) {
+        let msg = &self.json;
+        match self.class {
+            MsgClass::Tpv => {
+                extract_tpv(msg, data);
+                data.last_tpv = self.receipt_time;
+            }
+            MsgClass::Sky => extract_sky(msg, data),
+            MsgClass::Pps => extract_pps(msg, data),
+            MsgClass::Toff => extract_toff(msg, data),
+            MsgClass::Devices => extract_devices(msg, data),
+            MsgClass::Device => extract_device(msg, data),
+            MsgClass::Version => extract_version(msg, data),
+            MsgClass::Watch | MsgClass::Error | MsgClass::Other => {}
+        }
+        data.last_seen = self.receipt_time;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum GpsdEvent {
-    Update(Box<GPSData>),
+    /// TCP connection established and WATCH sent.
+    Connected,
+    Message(GpsdMessage),
     Error(String),
     Nmea(String),
+}
+
+/// An event tagged with the connection generation of the task that sent it,
+/// so the app can discard events from a task it has already replaced.
+pub type TaggedEvent = (u64, GpsdEvent);
+
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 pub async fn gpsd_task(
     host: String,
     port: u16,
-    tx: mpsc::Sender<GpsdEvent>,
+    generation: u64,
+    tx: mpsc::Sender<TaggedEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        match connect_and_read(&host, port, &tx, &mut shutdown).await {
+        match connect_and_read(&host, port, generation, &tx, &mut shutdown).await {
             Ok(()) => break, // clean shutdown
             Err(e) => {
-                let _ = tx.send(GpsdEvent::Error(e.to_string())).await;
+                if tx
+                    .send((generation, GpsdEvent::Error(e.to_string())))
+                    .await
+                    .is_err()
+                {
+                    break; // receiver gone
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                    _ = tokio::time::sleep(RECONNECT_DELAY) => {},
                     _ = shutdown.changed() => break,
                 }
             }
@@ -37,10 +141,14 @@ pub async fn gpsd_task(
 async fn connect_and_read(
     host: &str,
     port: u16,
-    tx: &mpsc::Sender<GpsdEvent>,
+    generation: u64,
+    tx: &mpsc::Sender<TaggedEvent>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let stream = TcpStream::connect((host, port)).await?;
+    let stream = tokio::select! {
+        s = TcpStream::connect((host, port)) => s?,
+        _ = shutdown.changed() => return Ok(()),
+    };
     let (reader, mut writer) = stream.into_split();
 
     // Send WATCH command
@@ -48,33 +156,29 @@ async fn connect_and_read(
     writer.write_all(watch.as_bytes()).await?;
     writer.write_all(b"\n").await?;
 
+    let send = |event: GpsdEvent| tx.send((generation, event));
+    send(GpsdEvent::Connected)
+        .await
+        .map_err(|_| anyhow!("event receiver closed"))?;
+
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let mut data = GPSData {
-        connected: true,
-        ..Default::default()
-    };
+    let mut buf = Vec::with_capacity(4096);
 
     loop {
-        line.clear();
         tokio::select! {
-            result = reader.read_line(&mut line) => {
-                let n = result?;
-                if n == 0 {
-                    return Err(anyhow!("gpsd connection closed"));
-                }
-
-                let receipt_time = std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)?
-                    .as_secs_f64();
-
-                // Check for NMEA
-                let trimmed = line.trim();
-                if trimmed.starts_with('$') || trimmed.starts_with('!') {
-                    let _ = tx.send(GpsdEvent::Nmea(trimmed.to_string())).await;
-                } else {
-                    process_message(trimmed, &mut data, receipt_time);
-                    let _ = tx.send(GpsdEvent::Update(Box::new(data.clone()))).await;
+            result = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LEN) => {
+                let event = match result? {
+                    LineRead::Eof => return Err(anyhow!("gpsd connection closed")),
+                    LineRead::Oversized => continue,
+                    LineRead::Line => {
+                        let line = String::from_utf8_lossy(&buf);
+                        classify_line(&line, unix_now())
+                    }
+                };
+                if let Some(event) = event
+                    && send(event).await.is_err()
+                {
+                    return Ok(()); // receiver gone: nothing left to do
                 }
             }
             _ = shutdown.changed() => return Ok(()),
@@ -82,29 +186,83 @@ async fn connect_and_read(
     }
 }
 
-fn process_message(line: &str, data: &mut GPSData, receipt_time: f64) {
-    let msg: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let class = msg["class"].as_str().unwrap_or("");
-
-    match class {
-        "TPV" => extract_tpv(&msg, data),
-        "SKY" => extract_sky(&msg, data),
-        "PPS" => extract_pps(&msg, data),
-        "TOFF" => extract_toff(&msg, data),
-        "DEVICES" => extract_devices(&msg, data),
-        "DEVICE" => extract_device(&msg, data),
-        "VERSION" => extract_version(&msg, data),
-        _ => {} // ignore unknown classes
+/// Turn one raw line from gpsd into an event, or `None` if it should be ignored.
+pub fn classify_line(line: &str, receipt_time: f64) -> Option<GpsdEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
     }
+    if trimmed.starts_with('$') || trimmed.starts_with('!') {
+        return Some(GpsdEvent::Nmea(trimmed.to_string()));
+    }
+    GpsdMessage::parse(trimmed, receipt_time).map(GpsdEvent::Message)
+}
 
-    data.last_seen = receipt_time;
+/// Outcome of [`read_line_bounded`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineRead {
+    /// A line (without its trailing newline) is in the buffer.
+    Line,
+    /// A line longer than the limit was read and discarded.
+    Oversized,
+    /// End of stream, no more data.
+    Eof,
+}
+
+/// Read one `\n`-terminated line into `buf` (newline stripped), never holding
+/// more than `max` bytes. Oversized lines are consumed and discarded.
+pub async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let chunk = match newline {
+            Some(i) => &available[..i],
+            None => available,
+        };
+        if !oversized {
+            if buf.len() + chunk.len() > max {
+                oversized = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        let consumed = newline.map_or(available.len(), |i| i + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else {
+                LineRead::Line
+            });
+        }
+    }
 }
 
 fn json_f64(msg: &Value, key: &str) -> f64 {
     msg[key].as_f64().unwrap_or(f64::NAN)
+}
+
+/// Overwrite `target` only if `key` is present as a number.
+fn set_if_present(msg: &Value, key: &str, target: &mut f64) {
+    if let Some(v) = msg[key].as_f64() {
+        *target = v;
+    }
 }
 
 fn extract_tpv(msg: &Value, data: &mut GPSData) {
@@ -149,18 +307,19 @@ fn extract_tpv(msg: &Value, data: &mut GPSData) {
     }
 }
 
+/// SKY messages may be partial (e.g. u-blox sends DOPs and satellites in
+/// separate messages), so only fields that are present are overwritten.
 fn extract_sky(msg: &Value, data: &mut GPSData) {
-    data.dop.hdop = json_f64(msg, "hdop");
-    data.dop.vdop = json_f64(msg, "vdop");
-    data.dop.pdop = json_f64(msg, "pdop");
-    data.dop.gdop = json_f64(msg, "gdop");
-    data.dop.tdop = json_f64(msg, "tdop");
-    data.dop.xdop = json_f64(msg, "xdop");
-    data.dop.ydop = json_f64(msg, "ydop");
+    set_if_present(msg, "hdop", &mut data.dop.hdop);
+    set_if_present(msg, "vdop", &mut data.dop.vdop);
+    set_if_present(msg, "pdop", &mut data.dop.pdop);
+    set_if_present(msg, "gdop", &mut data.dop.gdop);
+    set_if_present(msg, "tdop", &mut data.dop.tdop);
+    set_if_present(msg, "xdop", &mut data.dop.xdop);
+    set_if_present(msg, "ydop", &mut data.dop.ydop);
 
-    if let Some(sats) = msg["satellites"].as_array()
-        && !sats.is_empty()
-    {
+    // An explicit (possibly empty) array replaces the list; absent keeps it.
+    if let Some(sats) = msg["satellites"].as_array() {
         data.satellites = sats
             .iter()
             .map(|s| SatelliteInfo {
@@ -208,6 +367,7 @@ fn extract_device(msg: &Value, data: &mut GPSData) {
     extract_device_fields(msg, data);
 }
 
+/// DEVICE notifications can be partial, so only present fields are updated.
 fn extract_device_fields(msg: &Value, data: &mut GPSData) {
     if let Some(v) = msg["path"].as_str() {
         data.device.path = v.to_string();
@@ -218,13 +378,17 @@ fn extract_device_fields(msg: &Value, data: &mut GPSData) {
     if let Some(v) = msg["subtype"].as_str() {
         data.device.subtype = v.to_string();
     }
-    data.device.bps = msg["bps"].as_u64().unwrap_or(0) as u32;
-    data.device.cycle = json_f64(msg, "cycle");
-    data.device.mincycle = json_f64(msg, "mincycle");
+    if let Some(v) = msg["bps"].as_u64() {
+        data.device.bps = v as u32;
+    }
+    set_if_present(msg, "cycle", &mut data.device.cycle);
+    set_if_present(msg, "mincycle", &mut data.device.mincycle);
     if let Some(v) = msg["activated"].as_str() {
         data.device.activated = v.to_string();
     }
-    data.device.native = msg["native"].as_u64().unwrap_or(0) as u8;
+    if let Some(v) = msg["native"].as_u64() {
+        data.device.native = v as u8;
+    }
 }
 
 fn extract_version(msg: &Value, data: &mut GPSData) {
@@ -238,6 +402,14 @@ fn extract_version(msg: &Value, data: &mut GPSData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    fn apply_line(line: &str, data: &mut GPSData, t: f64) -> Option<MsgClass> {
+        let msg = GpsdMessage::parse(line, t)?;
+        msg.apply(data);
+        Some(msg.class)
+    }
 
     #[test]
     fn test_json_f64_present() {
@@ -316,6 +488,45 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_sky_keeps_dops_and_satellites() {
+        let mut data = GPSData::default();
+        apply_line(
+            r#"{"class":"SKY","hdop":0.8,"pdop":1.5,"satellites":[{"PRN":1,"used":true}]}"#,
+            &mut data,
+            1.0,
+        );
+        // Satellites-only partial SKY: DOPs must survive
+        apply_line(
+            r#"{"class":"SKY","satellites":[{"PRN":2,"used":true},{"PRN":3}]}"#,
+            &mut data,
+            2.0,
+        );
+        assert!((data.dop.hdop - 0.8).abs() < 1e-10);
+        assert!((data.dop.pdop - 1.5).abs() < 1e-10);
+        assert_eq!(data.satellites.len(), 2);
+        // DOP-only partial SKY: satellites must survive, present DOP updated
+        apply_line(r#"{"class":"SKY","hdop":1.1}"#, &mut data, 3.0);
+        assert!((data.dop.hdop - 1.1).abs() < 1e-10);
+        assert!((data.dop.pdop - 1.5).abs() < 1e-10);
+        assert_eq!(data.satellites.len(), 2);
+        assert_eq!(data.satellites_used, 1);
+    }
+
+    #[test]
+    fn test_empty_satellites_clears_list() {
+        let mut data = GPSData::default();
+        apply_line(
+            r#"{"class":"SKY","satellites":[{"PRN":1,"used":true}]}"#,
+            &mut data,
+            1.0,
+        );
+        assert_eq!(data.satellites.len(), 1);
+        apply_line(r#"{"class":"SKY","satellites":[]}"#, &mut data, 2.0);
+        assert!(data.satellites.is_empty());
+        assert_eq!(data.satellites_used, 0);
+    }
+
+    #[test]
     fn test_extract_pps() {
         let mut data = GPSData::default();
         let msg: Value = serde_json::from_str(
@@ -379,20 +590,189 @@ mod tests {
         assert_eq!(data.device.path, "/dev/ttyACM0");
         assert_eq!(data.device.driver, "u-blox");
         assert_eq!(data.device.bps, 9600);
+
+        // Partial DEVICE notification keeps earlier fields
+        apply_line(
+            r#"{"class":"DEVICE","path":"/dev/ttyACM0","activated":"2024-01-01T00:00:00Z"}"#,
+            &mut data,
+            1.0,
+        );
+        assert_eq!(data.device.bps, 9600);
+        assert!((data.device.cycle - 1.0).abs() < 1e-10);
+        assert_eq!(data.device.activated, "2024-01-01T00:00:00Z");
     }
 
     #[test]
-    fn test_process_message_invalid_json() {
-        let mut data = GPSData::default();
-        process_message("not valid json", &mut data, 0.0);
-        // Should not crash, data unchanged
-        assert_eq!(data.mode, FixMode::Unknown);
+    fn test_parse_invalid_json_is_none() {
+        assert!(GpsdMessage::parse("not valid json", 0.0).is_none());
+        assert!(GpsdMessage::parse(r#"{"no_class": 1}"#, 0.0).is_none());
     }
 
     #[test]
-    fn test_process_message_unknown_class() {
+    fn test_parse_unknown_class_is_none() {
+        assert!(GpsdMessage::parse(r#"{"class": "UNKNOWN"}"#, 100.0).is_none());
+    }
+
+    #[test]
+    fn test_parse_tags_class() {
+        let cases = [
+            (r#"{"class":"TPV","mode":1}"#, MsgClass::Tpv),
+            (r#"{"class":"SKY"}"#, MsgClass::Sky),
+            (r#"{"class":"PPS"}"#, MsgClass::Pps),
+            (r#"{"class":"TOFF"}"#, MsgClass::Toff),
+            (r#"{"class":"DEVICES","devices":[]}"#, MsgClass::Devices),
+            (r#"{"class":"DEVICE"}"#, MsgClass::Device),
+            (r#"{"class":"VERSION"}"#, MsgClass::Version),
+            (r#"{"class":"WATCH","enable":true}"#, MsgClass::Watch),
+            (r#"{"class":"ERROR","message":"x"}"#, MsgClass::Error),
+        ];
+        for (line, class) in cases {
+            assert_eq!(
+                GpsdMessage::parse(line, 0.0).unwrap().class,
+                class,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tpv_sets_last_tpv_others_only_last_seen() {
         let mut data = GPSData::default();
-        process_message(r#"{"class": "UNKNOWN"}"#, &mut data, 100.0);
-        assert!((data.last_seen - 100.0).abs() < 1e-10);
+        apply_line(r#"{"class":"TPV","mode":3}"#, &mut data, 10.0);
+        assert_eq!(data.last_tpv, 10.0);
+        assert_eq!(data.last_seen, 10.0);
+        apply_line(r#"{"class":"PPS"}"#, &mut data, 12.0);
+        assert_eq!(data.last_tpv, 10.0);
+        assert_eq!(data.last_seen, 12.0);
+    }
+
+    #[test]
+    fn test_classify_line() {
+        assert!(matches!(
+            classify_line("$GPGGA,1,2,3*00\r\n", 0.0),
+            Some(GpsdEvent::Nmea(s)) if s == "$GPGGA,1,2,3*00"
+        ));
+        assert!(matches!(
+            classify_line("!AIVDM,x", 0.0),
+            Some(GpsdEvent::Nmea(_))
+        ));
+        assert!(classify_line("   ", 0.0).is_none());
+        assert!(classify_line("garbage", 0.0).is_none());
+        assert!(classify_line(r#"{"class":"FOO"}"#, 0.0).is_none());
+        assert!(matches!(
+            classify_line(r#"{"class":"TPV"}"#, 0.0),
+            Some(GpsdEvent::Message(m)) if m.class == MsgClass::Tpv
+        ));
+    }
+
+    // === Bounded line reader ===
+
+    async fn read_all_lines(input: &[u8], cap: usize, max: usize) -> Vec<(LineRead, Vec<u8>)> {
+        let mut reader = BufReader::with_capacity(cap, input);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            let r = read_line_bounded(&mut reader, &mut buf, max).await.unwrap();
+            let done = r == LineRead::Eof;
+            out.push((r, buf.clone()));
+            if done {
+                return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_lines_and_eof() {
+        let out = read_all_lines(b"abc\ndef\nghi", 2, 100).await;
+        assert_eq!(
+            out,
+            vec![
+                (LineRead::Line, b"abc".to_vec()),
+                (LineRead::Line, b"def".to_vec()),
+                (LineRead::Line, b"ghi".to_vec()),
+                (LineRead::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_discards_oversized() {
+        let mut input = vec![b'x'; 50];
+        input.extend_from_slice(b"\nok\n");
+        input.extend_from_slice(&[b'y'; 20]); // oversized, unterminated at EOF
+        let out = read_all_lines(&input, 4, 10).await;
+        assert_eq!(
+            out,
+            vec![
+                (LineRead::Oversized, vec![]),
+                (LineRead::Line, b"ok".to_vec()),
+                (LineRead::Oversized, vec![]),
+                (LineRead::Eof, vec![]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_reader_exact_limit_ok() {
+        let out = read_all_lines(b"0123456789\n", 3, 10).await;
+        assert_eq!(out[0], (LineRead::Line, b"0123456789".to_vec()));
+    }
+
+    // === Client loop against a mock gpsd ===
+
+    async fn recv(rx: &mut mpsc::Receiver<TaggedEvent>) -> TaggedEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for event")
+            .expect("channel closed")
+    }
+
+    #[tokio::test]
+    async fn test_client_against_mock_gpsd() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(gpsd_task("127.0.0.1".to_string(), port, 7, tx, shutdown_rx));
+
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut watch = vec![0u8; 256];
+        let n = sock.read(&mut watch).await.unwrap();
+        assert!(String::from_utf8_lossy(&watch[..n]).starts_with("?WATCH="));
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"{\"class\":\"VERSION\",\"release\":\"3.\xff\"}\n");
+        payload.extend_from_slice(&vec![b'z'; MAX_LINE_LEN + 10]);
+        payload.extend_from_slice(b"\n{\"class\":\"BOGUS\"}\nnot json\n");
+        payload.extend_from_slice(b"$GPGGA,123\r\n");
+        payload.extend_from_slice(
+            b"{\"class\":\"TPV\",\"mode\":3,\"time\":\"2024-01-15T12:30:00Z\"}\n",
+        );
+        sock.write_all(&payload).await.unwrap();
+        drop(sock);
+
+        assert!(matches!(recv(&mut rx).await, (7, GpsdEvent::Connected)));
+        // Invalid UTF-8 is replaced, not a disconnect
+        match recv(&mut rx).await {
+            (7, GpsdEvent::Message(m)) => {
+                assert_eq!(m.class, MsgClass::Version);
+                assert!(m.json["release"].as_str().unwrap().starts_with("3."));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Oversized line, unknown class and invalid JSON produce nothing
+        assert!(matches!(recv(&mut rx).await, (7, GpsdEvent::Nmea(s)) if s == "$GPGGA,123"));
+        match recv(&mut rx).await {
+            (7, GpsdEvent::Message(m)) => assert_eq!(m.class, MsgClass::Tpv),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(recv(&mut rx).await, (7, GpsdEvent::Error(e)) if e.contains("closed")));
+
+        // Clean shutdown during the reconnect delay
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("task did not stop")
+            .unwrap();
     }
 }

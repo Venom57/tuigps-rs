@@ -4,15 +4,13 @@ use futures::StreamExt;
 use ratatui::prelude::*;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-use crate::clock_sync;
+use crate::clock_sync::{self, ClockSyncRequest};
 use crate::data_model::GPSData;
 use crate::gps_logger::{GpsLogger, LogFormat};
-use crate::gpsd_client::{self, GpsdEvent};
+use crate::gpsd_client::{self, GpsdEvent, GpsdMessage, MsgClass, TaggedEvent};
 use crate::position_hold::PositionHold;
 use crate::ui;
 
@@ -95,6 +93,21 @@ impl CoordFormat {
         }
     }
 }
+
+/// Maximum number of lines kept in the Device tab output log.
+pub const OUTPUT_LOG_MAX: usize = 500;
+
+/// Seconds without a TPV before data is flagged stale.
+pub const STALE_AFTER_SECS: f64 = 10.0;
+
+/// Minimum interval between redraws triggered by gpsd/command traffic (~20 fps).
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Upper bound on gpsd events drained per loop iteration before drawing.
+const MAX_DRAIN: usize = 256;
+
+/// Consecutive terminal input errors tolerated before giving up.
+const MAX_INPUT_ERRORS: u32 = 20;
 
 // NMEA filter types to cycle through
 const NMEA_FILTERS: &[&str] = &["", "GGA", "RMC", "GSA", "GSV", "VTG", "GLL", "ZDA"];
@@ -189,6 +202,15 @@ impl DeviceConfigState {
             proto_version: "18".to_string(),
         }
     }
+
+    /// Append a line to the output log, dropping the oldest beyond the cap.
+    pub fn push_log(&mut self, line: impl Into<String>) {
+        self.output_log.push(line.into());
+        if self.output_log.len() > OUTPUT_LOG_MAX {
+            let excess = self.output_log.len() - OUTPUT_LOG_MAX;
+            self.output_log.drain(..excess);
+        }
+    }
 }
 
 pub struct App {
@@ -228,7 +250,13 @@ pub struct App {
 
     // Clock sync
     pub armed_clock_set: bool,
-    pub armed_toff: Arc<AtomicBool>,
+    pub armed_toff: bool,
+    /// Clock sync request waiting to be dispatched by the event loop.
+    pub pending_clock_sync: Option<ClockSyncRequest>,
+
+    /// Generation of the current gpsd connection task; events tagged with an
+    /// older generation (from an aborted task) are ignored.
+    pub connection_generation: u64,
 
     // Staleness
     pub stale: bool,
@@ -244,11 +272,16 @@ pub struct App {
     // Channel for async command output (device config)
     pub cmd_tx: mpsc::Sender<String>,
     pub cmd_rx: mpsc::Receiver<String>,
+
+    // Channel for async status messages (clock sync results)
+    pub status_tx: mpsc::Sender<String>,
+    pub status_rx: mpsc::Receiver<String>,
 }
 
 impl App {
     pub fn new(host: String, port: u16) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (status_tx, status_rx) = mpsc::channel(8);
         Self {
             gps_data: GPSData::default(),
             active_tab: ActiveTab::Dashboard,
@@ -274,7 +307,9 @@ impl App {
             device_config: DeviceConfigState::new(),
             pending_device_cmds: Vec::new(),
             armed_clock_set: false,
-            armed_toff: Arc::new(AtomicBool::new(false)),
+            armed_toff: false,
+            pending_clock_sync: None,
+            connection_generation: 0,
             stale: false,
             stale_seconds: 0.0,
             reconnect_requested: false,
@@ -282,15 +317,27 @@ impl App {
             status_message_tick: 0,
             cmd_tx,
             cmd_rx,
+            status_tx,
+            status_rx,
         }
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
+    pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = msg.into();
         self.status_message_tick = 5; // show for 5 ticks (seconds)
     }
 
     pub fn handle_event(&mut self, event: Event) {
+        // Ctrl+C always quits, regardless of tab or overlay.
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.should_quit = true;
+            return;
+        }
+
         if self.show_settings {
             self.handle_settings_input(event);
             return;
@@ -319,91 +366,45 @@ impl App {
         }
     }
 
+    /// Handle an event from a gpsd task, ignoring events from a task that
+    /// has since been replaced (reconnect). Returns whether it was applied.
+    pub fn handle_tagged_event(&mut self, (generation, event): TaggedEvent) -> bool {
+        if generation != self.connection_generation {
+            return false;
+        }
+        self.handle_gpsd_event(event);
+        true
+    }
+
+    /// Start a new connection generation; called when the gpsd task is
+    /// restarted. Returns the generation the new task must tag events with.
+    pub fn begin_reconnect(&mut self) -> u64 {
+        self.connection_generation += 1;
+        self.gps_data.connected = false;
+        self.gps_data.error_message = "Reconnecting...".to_string();
+        self.stale = false;
+        self.stale_seconds = 0.0;
+        self.connection_generation
+    }
+
     pub fn handle_gpsd_event(&mut self, event: GpsdEvent) {
         match event {
-            GpsdEvent::Update(data) => {
-                // Preserve app-managed TOFF state across gpsd updates
-                let toff_samples = std::mem::take(&mut self.gps_data.toff_samples);
-                let toff_armed_offset = self.gps_data.toff_armed_offset;
-                let toff_armed_gps_time = std::mem::take(&mut self.gps_data.toff_armed_gps_time);
-                let toff_armed_sys_time = self.gps_data.toff_armed_sys_time;
-                let prev_time = std::mem::take(&mut self.gps_data.time);
-
-                self.gps_data = *data;
-
-                // Restore app-managed TOFF state
-                self.gps_data.toff_samples = toff_samples;
-                self.gps_data.toff_armed_offset = toff_armed_offset;
-                self.gps_data.toff_armed_gps_time = toff_armed_gps_time;
-                self.gps_data.toff_armed_sys_time = toff_armed_sys_time;
-
+            GpsdEvent::Connected => {
+                // Fresh connection: drop data from any previous session but
+                // keep app-managed TOFF state.
+                let old = std::mem::take(&mut self.gps_data);
+                self.gps_data = GPSData {
+                    connected: true,
+                    toff_samples: old.toff_samples,
+                    toff_armed_offset: old.toff_armed_offset,
+                    toff_armed_gps_time: old.toff_armed_gps_time,
+                    toff_armed_sys_time: old.toff_armed_sys_time,
+                    ..Default::default()
+                };
                 self.stale = false;
                 self.stale_seconds = 0.0;
-
-                // Compute TOFF offset only when GPS time changes (new TPV)
-                let new_time = &self.gps_data.time;
-                if !new_time.is_empty()
-                    && *new_time != prev_time
-                    && self.gps_data.last_seen > 0.0
-                    && let Ok(gps_time) = chrono::DateTime::parse_from_rfc3339(new_time)
-                {
-                    let gps_epoch = gps_time.timestamp() as f64
-                        + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
-                    let offset = gps_epoch - self.gps_data.last_seen;
-
-                    // Accumulate in circular buffer (max 20)
-                    if self.gps_data.toff_samples.len() >= 20 {
-                        self.gps_data.toff_samples.remove(0);
-                    }
-                    self.gps_data.toff_samples.push(offset);
-
-                    // Check for armed single-shot TOFF capture
-                    if self
-                        .armed_toff
-                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        self.gps_data.toff_armed_offset = offset;
-                        self.gps_data.toff_armed_gps_time = self.gps_data.time.clone();
-                        self.gps_data.toff_armed_sys_time = self.gps_data.last_seen;
-                        self.set_status(format!(
-                            "TOFF captured: {}",
-                            crate::formatting::fmt_offset(offset)
-                        ));
-                    }
-                }
-
-                // Armed clock sync — fires on fresh TPV for minimum latency
-                if self.armed_clock_set
-                    && !self.gps_data.time.is_empty()
-                    && self.gps_data.last_seen > 0.0
-                {
-                    self.armed_clock_set = false;
-                    match clock_sync::set_clock_from_gps(
-                        &self.gps_data.time,
-                        self.gps_data.last_seen,
-                    ) {
-                        Ok(msg) => self.set_status(&msg),
-                        Err(e) => self.set_status(format!("Clock sync error: {}", e)),
-                    }
-                }
-
-                // Log if active
-                if let Some(ref mut logger) = self.logger {
-                    let _ = logger.log_point(&self.gps_data);
-                }
-
-                // Position hold
-                if let Some(ref mut hold) = self.position_hold
-                    && self.gps_data.has_fix()
-                {
-                    hold.add_fix(
-                        self.gps_data.latitude,
-                        self.gps_data.longitude,
-                        self.gps_data.alt_msl,
-                    );
-                }
             }
+            GpsdEvent::Message(msg) => self.handle_message(msg),
             GpsdEvent::Error(msg) => {
                 self.gps_data.connected = false;
                 self.gps_data.error_message = msg;
@@ -424,19 +425,102 @@ impl App {
         }
     }
 
-    pub fn tick(&mut self) {
-        // Staleness detection
-        if self.gps_data.last_seen > 0.0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            let age = now - self.gps_data.last_seen;
-            if age > 10.0 {
-                self.stale = true;
-                self.stale_seconds = age;
+    fn handle_message(&mut self, msg: GpsdMessage) {
+        let prev_time = if msg.class == MsgClass::Tpv {
+            Some(self.gps_data.time.clone())
+        } else {
+            None
+        };
+        msg.apply(&mut self.gps_data);
+        self.gps_data.connected = true;
+
+        match msg.class {
+            MsgClass::Tpv => self.on_tpv(&prev_time.unwrap_or_default()),
+            MsgClass::Error => {
+                let text = msg.json["message"].as_str().unwrap_or("unknown error");
+                self.set_status(format!("gpsd error: {}", text));
+            }
+            _ => {}
+        }
+    }
+
+    /// Per-TPV processing. Everything here runs only on TPV messages, never
+    /// on SKY/PPS/TOFF/DEVICE traffic.
+    fn on_tpv(&mut self, prev_time: &str) {
+        self.stale = false;
+        self.stale_seconds = 0.0;
+
+        let time = &self.gps_data.time;
+        let new_time = !time.is_empty() && time != prev_time;
+        // A TPV without a timestamp still counts as a new epoch for sampling.
+        let new_epoch = time.is_empty() || new_time;
+
+        // TOFF offset against the TPV receipt time
+        if new_time
+            && self.gps_data.last_tpv > 0.0
+            && let Ok(gps_time) = chrono::DateTime::parse_from_rfc3339(time)
+        {
+            let gps_epoch =
+                gps_time.timestamp() as f64 + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
+            let offset = gps_epoch - self.gps_data.last_tpv;
+
+            // Accumulate in circular buffer (max 20)
+            if self.gps_data.toff_samples.len() >= 20 {
+                self.gps_data.toff_samples.remove(0);
+            }
+            self.gps_data.toff_samples.push(offset);
+
+            // Armed single-shot TOFF capture
+            if self.armed_toff {
+                self.armed_toff = false;
+                self.gps_data.toff_armed_offset = offset;
+                self.gps_data.toff_armed_gps_time = self.gps_data.time.clone();
+                self.gps_data.toff_armed_sys_time = self.gps_data.last_tpv;
+                self.set_status(format!(
+                    "TOFF captured: {}",
+                    crate::formatting::fmt_offset(offset)
+                ));
             }
         }
+
+        // Armed clock sync: fresh TPV with a 2D/3D fix only. Execution is
+        // deferred to the event loop so it never blocks here.
+        if self.armed_clock_set && new_time && self.gps_data.has_fix() {
+            self.armed_clock_set = false;
+            self.pending_clock_sync = Some(ClockSyncRequest {
+                gps_time: self.gps_data.time.clone(),
+                tpv_receipt: self.gps_data.last_tpv,
+            });
+            self.set_status("Clock sync: setting system clock...");
+        }
+
+        // Log if active (the logger de-duplicates by time)
+        if let Some(ref mut logger) = self.logger
+            && let Err(e) = logger.log_point(&self.gps_data)
+        {
+            let msg = format!("Log write error: {}", e);
+            self.set_status(msg);
+        }
+
+        // Position hold: one sample per new fix
+        if new_epoch
+            && self.gps_data.has_fix()
+            && let Some(ref mut hold) = self.position_hold
+        {
+            hold.add_fix(
+                self.gps_data.latitude,
+                self.gps_data.longitude,
+                self.gps_data.alt_msl,
+            );
+        }
+    }
+
+    pub fn tick(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.update_staleness(now);
 
         // Auto-clear status message
         if self.status_message_tick > 0 {
@@ -445,6 +529,23 @@ impl App {
                 self.status_message.clear();
             }
         }
+    }
+
+    /// Staleness is based on the age of the last TPV, so PPS/DEVICE/etc.
+    /// traffic cannot mask lost fixes. Before any TPV arrives, the last
+    /// message of any class is used instead.
+    pub fn update_staleness(&mut self, now: f64) {
+        let reference = if self.gps_data.last_tpv > 0.0 {
+            self.gps_data.last_tpv
+        } else {
+            self.gps_data.last_seen
+        };
+        if reference <= 0.0 {
+            return;
+        }
+        let age = now - reference;
+        self.stale = age > STALE_AFTER_SECS;
+        self.stale_seconds = if self.stale { age } else { 0.0 };
     }
 
     fn next_tab(&mut self) {
@@ -463,35 +564,65 @@ impl App {
         self.units = self.units.next();
     }
 
-    fn open_maps(&self) {
-        if self.gps_data.has_fix() {
-            let url = format!(
+    fn maps_url(&self) -> Option<String> {
+        self.gps_data.has_fix().then(|| {
+            format!(
                 "https://www.google.com/maps?q={},{}",
                 self.gps_data.latitude, self.gps_data.longitude
-            );
-            let _ = open::that(url);
+            )
+        })
+    }
+
+    fn open_maps(&mut self) {
+        match self.maps_url() {
+            None => self.set_status("No fix: cannot open map"),
+            Some(url) => match open::that(&url) {
+                Ok(()) => self.set_status("Opened map in browser"),
+                Err(e) => self.set_status(format!("Failed to open browser: {}", e)),
+            },
         }
     }
 
     fn toggle_logging(&mut self) {
-        if let Some(ref mut logger) = self.logger {
-            if logger.active {
-                let _ = logger.stop();
-                self.logger = None;
-            }
+        if self.logger.is_some() {
+            self.stop_logging();
         } else {
             let mut logger = GpsLogger::new(LogFormat::Gpx, &self.log_dir);
-            if logger.start().is_ok() {
-                self.logger = Some(logger);
+            match logger.start() {
+                Ok(()) => {
+                    self.set_status(format!("Logging to {}", logger.filename));
+                    self.logger = Some(logger);
+                }
+                Err(e) => self.set_status(format!("Failed to start logging: {}", e)),
+            }
+        }
+    }
+
+    /// Stop and close the active log (if any), reporting the result.
+    pub fn stop_logging(&mut self) {
+        if let Some(mut logger) = self.logger.take() {
+            match logger.stop() {
+                Ok(()) => self.set_status(format!(
+                    "Logging stopped: {} points written to {}",
+                    logger.point_count, logger.filename
+                )),
+                Err(e) => self.set_status(format!("Error closing log {}: {}", logger.filename, e)),
             }
         }
     }
 
     fn toggle_hold(&mut self) {
-        if self.position_hold.is_some() {
-            self.position_hold = None;
+        if let Some(hold) = self.position_hold.take() {
+            match hold.result() {
+                Some(r) => self.set_status(format!(
+                    "Hold stopped: {} fixes, mean {:.7}, {:.7}",
+                    r.count, r.mean_lat, r.mean_lon
+                )),
+                None => self.set_status("Hold stopped (fewer than 2 fixes)"),
+            }
         } else {
             self.position_hold = Some(PositionHold::new());
+            self.set_status("Position hold started");
         }
     }
 
@@ -627,7 +758,7 @@ impl App {
             },
             ActiveTab::Timing => match key.code {
                 KeyCode::Char('a') => {
-                    self.armed_toff.store(true, Ordering::SeqCst);
+                    self.armed_toff = true;
                     self.set_status("TOFF armed — waiting for next fix...");
                 }
                 KeyCode::Char('c') => {
@@ -637,7 +768,7 @@ impl App {
                     self.gps_data.toff_armed_offset = f64::NAN;
                     self.gps_data.toff_armed_gps_time.clear();
                     self.gps_data.toff_armed_sys_time = f64::NAN;
-                    self.armed_toff.store(false, Ordering::SeqCst);
+                    self.armed_toff = false;
                     if had_data {
                         self.set_status("TOFF data cleared");
                     } else {
@@ -651,7 +782,7 @@ impl App {
                         self.set_status("Clock sync disarmed");
                     } else {
                         self.armed_clock_set = true;
-                        self.set_status("Clock sync ARMED — will fire on next GPS fix");
+                        self.set_status("Clock sync ARMED — will fire on next 2D/3D fix");
                     }
                 }
                 _ => {}
@@ -737,30 +868,27 @@ impl App {
             0 => {
                 // Nav rate
                 let (name, ms) = NAV_RATES[dc.nav_rate_idx];
-                dc.output_log
-                    .push(format!("Setting nav rate: {} ({}ms)...", name, ms));
+                dc.push_log(format!("Setting nav rate: {} ({}ms)...", name, ms));
                 self.queue_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)]);
             }
             1 => {
                 // Power mode
                 let (name, mode) = POWER_MODES[dc.power_mode_idx];
-                dc.output_log
-                    .push(format!("Setting power mode: {}...", name));
+                dc.push_log(format!("Setting power mode: {}...", name));
                 self.queue_ubxtool(&["-p", &format!("PMS,{}", mode)]);
             }
             2 => {
                 // Serial speed (two-step: ubxtool then gpsctl)
                 let speed = SERIAL_SPEEDS[dc.serial_speed_idx];
                 let device = self.gps_data.device.path.clone();
-                dc.output_log
-                    .push(format!("Setting baud rate to {}...", speed));
+                dc.push_log(format!("Setting baud rate to {}...", speed));
                 self.pending_device_cmds
                     .push(DeviceCommand::BaudRate { speed, device });
             }
             3 => {
                 // PPS frequency
                 let (name, freq) = PPS_FREQUENCIES[dc.pps_frequency_idx];
-                dc.output_log.push(format!("Setting PPS: {}...", name));
+                dc.push_log(format!("Setting PPS: {}...", name));
                 let cmd = build_tp5_cmd(freq, 100000, true);
                 self.queue_ubxtool(&["-c", &cmd]);
             }
@@ -772,12 +900,12 @@ impl App {
                 let enabled = dc.gnss_enabled[idx];
                 let flag = if enabled { "-e" } else { "-d" };
                 let state = if enabled { "Enabling" } else { "Disabling" };
-                dc.output_log.push(format!("{} {}...", state, name));
+                dc.push_log(format!("{} {}...", state, name));
                 self.queue_ubxtool(&[flag, ubx_name]);
             }
             10 => {
                 // Save config
-                dc.output_log.push("Saving config to flash...".to_string());
+                dc.push_log("Saving config to flash...".to_string());
                 self.queue_ubxtool(&["-p", "SAVE"]);
             }
             _ => {}
@@ -801,6 +929,21 @@ impl App {
                     self.run_baud_rate_change(speed, &device, &proto)
                 }
             }
+        }
+    }
+
+    /// Execute a queued clock sync on a blocking thread; the result comes
+    /// back through `status_rx`. Never called from tests.
+    fn dispatch_clock_sync(&mut self) {
+        if let Some(req) = self.pending_clock_sync.take() {
+            let tx = self.status_tx.clone();
+            tokio::spawn(async move {
+                let msg = match clock_sync::sync_clock_async(req).await {
+                    Ok(msg) => msg,
+                    Err(e) => format!("Clock sync error: {}", e),
+                };
+                let _ = tx.send(msg).await;
+            });
         }
     }
 
@@ -961,78 +1104,183 @@ fn build_tp5_cmd(freq_hz: u32, pulse_us: u32, active: bool) -> String {
     parts.join(",")
 }
 
+/// Redraw scheduling: urgent redraws (keys, tick) happen immediately; data
+/// redraws are coalesced to at most one per [`FRAME_INTERVAL`].
+#[derive(Debug)]
+struct FrameLimiter {
+    dirty: bool,
+    urgent: bool,
+    last_draw: Option<Instant>,
+}
+
+impl FrameLimiter {
+    fn new() -> Self {
+        Self {
+            dirty: true,
+            urgent: true,
+            last_draw: None,
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_urgent(&mut self) {
+        self.dirty = true;
+        self.urgent = true;
+    }
+
+    fn should_draw(&self, now: Instant) -> bool {
+        self.dirty
+            && (self.urgent
+                || self
+                    .last_draw
+                    .is_none_or(|t| now.duration_since(t) >= FRAME_INTERVAL))
+    }
+
+    fn drew(&mut self, now: Instant) {
+        self.dirty = false;
+        self.urgent = false;
+        self.last_draw = Some(now);
+    }
+
+    /// When the next coalesced redraw is due, if one is pending.
+    fn deadline(&self) -> Option<Instant> {
+        if !self.dirty {
+            return None;
+        }
+        Some(
+            self.last_draw
+                .map_or_else(Instant::now, |t| t + FRAME_INTERVAL),
+        )
+    }
+}
+
 pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
     let mut app = App::new(host.to_string(), port);
+    let result = event_loop(terminal, &mut app).await;
+    // Always close the log so the GPX file is valid, even on error.
+    app.stop_logging();
+    result
+}
 
-    // Channel for gpsd events
-    let (tx, mut rx) = mpsc::channel(100);
+async fn event_loop(terminal: &mut Terminal<impl Backend>, app: &mut App) -> Result<()> {
+    // Channel for gpsd events, tagged with the connection generation
+    let (tx, mut rx) = mpsc::channel::<TaggedEvent>(100);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Spawn gpsd task
-    let mut gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
-        host.to_string(),
-        port,
-        tx.clone(),
-        shutdown_rx.clone(),
-    ));
+    let spawn_gpsd = |app: &App| {
+        tokio::spawn(gpsd_client::gpsd_task(
+            app.host.clone(),
+            app.port,
+            app.connection_generation,
+            tx.clone(),
+            shutdown_rx.clone(),
+        ))
+    };
+    let mut gpsd_handle = spawn_gpsd(app);
 
     // Event stream
     let mut event_reader = crossterm::event::EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut frames = FrameLimiter::new();
+    let mut input_errors = 0u32;
 
-    loop {
-        tokio::select! {
-            Some(Ok(event)) = event_reader.next() => {
-                app.handle_event(event);
+    let result = loop {
+        let now = Instant::now();
+        if frames.should_draw(now) {
+            if let Err(e) = terminal.draw(|f| ui::render(f, app)) {
+                break Err(e.into());
             }
-            Some(gpsd_event) = rx.recv() => {
-                app.handle_gpsd_event(gpsd_event);
+            frames.drew(now);
+        }
+
+        let deadline = frames.deadline();
+        tokio::select! {
+            biased;
+            event = event_reader.next() => match event {
+                Some(Ok(event)) => {
+                    input_errors = 0;
+                    app.handle_event(event);
+                    frames.mark_urgent();
+                }
+                Some(Err(e)) => {
+                    input_errors += 1;
+                    if input_errors >= MAX_INPUT_ERRORS {
+                        // Input is unusable; quit rather than spin unquittable.
+                        break Err(anyhow::anyhow!("terminal input failed: {}", e));
+                    }
+                    app.set_status(format!("Terminal input error: {}", e));
+                    frames.mark_urgent();
+                }
+                None => {
+                    // Input stream ended: no way to receive 'q', so quit.
+                    app.should_quit = true;
+                }
+            },
+            _ = tick.tick() => {
+                app.tick();
+                frames.mark_urgent();
             }
             Some(cmd_output) = app.cmd_rx.recv() => {
                 // Split multi-line output into separate log entries
                 for line in cmd_output.lines() {
                     if !line.trim().is_empty() {
-                        app.device_config.output_log.push(line.to_string());
+                        app.device_config.push_log(line);
                     }
                 }
+                frames.mark_dirty();
             }
-            _ = tick.tick() => {
-                app.tick();
+            Some(status) = app.status_rx.recv() => {
+                app.set_status(status);
+                frames.mark_urgent();
             }
+            Some(event) = rx.recv() => {
+                let mut changed = app.handle_tagged_event(event);
+                // Drain whatever else is queued so one frame covers it all.
+                for _ in 0..MAX_DRAIN {
+                    match rx.try_recv() {
+                        Ok(event) => changed |= app.handle_tagged_event(event),
+                        Err(_) => break,
+                    }
+                }
+                if changed {
+                    frames.mark_dirty();
+                }
+            }
+            _ = sleep_until_opt(deadline), if deadline.is_some() => {}
         }
 
         app.dispatch_device_commands();
+        app.dispatch_clock_sync();
 
         // Handle reconnect
         if app.reconnect_requested {
             app.reconnect_requested = false;
-            // Abort old task and start new one
+            // Abort old task; any events it already queued carry the old
+            // generation and are discarded by handle_tagged_event.
             gpsd_handle.abort();
             let _ = gpsd_handle.await;
-
-            // Reset connection state
-            app.gps_data.connected = false;
-            app.gps_data.error_message = "Reconnecting...".to_string();
-            app.stale = false;
-
-            gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
-                app.host.clone(),
-                app.port,
-                tx.clone(),
-                shutdown_rx.clone(),
-            ));
+            app.begin_reconnect();
+            gpsd_handle = spawn_gpsd(app);
+            frames.mark_urgent();
         }
-
-        terminal.draw(|f| ui::render(f, &app))?;
 
         if app.should_quit {
-            let _ = shutdown_tx.send(true);
-            break;
+            break Ok(());
         }
-    }
+    };
 
+    let _ = shutdown_tx.send(true);
     gpsd_handle.abort();
-    Ok(())
+    result
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    if let Some(d) = deadline {
+        tokio::time::sleep_until(d.into()).await;
+    }
 }
 
 #[cfg(test)]
@@ -1060,6 +1308,34 @@ mod tests {
 
     fn new_app() -> App {
         App::new("localhost".to_string(), 2947)
+    }
+
+    fn now() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    fn json_event(line: &str, receipt: f64) -> GpsdEvent {
+        GpsdEvent::Message(GpsdMessage::parse(line, receipt).expect("valid gpsd message"))
+    }
+
+    /// A 3D-fix TPV at the given time, received at `receipt`.
+    fn tpv(time: &str, receipt: f64) -> GpsdEvent {
+        json_event(
+            &format!(
+                r#"{{"class":"TPV","mode":3,"lat":51.5,"lon":-0.1,"altMSL":10.0,"time":"{time}"}}"#
+            ),
+            receipt,
+        )
+    }
+
+    fn hold_count(app: &App) -> u64 {
+        app.position_hold
+            .as_ref()
+            .and_then(|h| h.result())
+            .map_or(0, |r| r.count)
     }
 
     // === Global keybindings ===
@@ -1355,7 +1631,7 @@ mod tests {
         app.active_tab = ActiveTab::Timing;
 
         app.handle_event(key_event(KeyCode::Char('a')));
-        assert!(app.armed_toff.load(Ordering::SeqCst));
+        assert!(app.armed_toff);
     }
 
     #[test]
@@ -1386,7 +1662,7 @@ mod tests {
         app.active_tab = ActiveTab::Timing;
 
         app.handle_event(key_event(KeyCode::Char('a')));
-        assert!(app.armed_toff.load(Ordering::SeqCst));
+        assert!(app.armed_toff);
         assert!(app.status_message.contains("armed"));
     }
 
@@ -1404,15 +1680,113 @@ mod tests {
         assert!(app.status_message.contains("disarmed"));
     }
 
-    #[test]
-    fn test_timing_clock_sync_stays_armed_without_gps_time() {
+    fn armed_app() -> App {
         let mut app = new_app();
         app.active_tab = ActiveTab::Timing;
         app.handle_event(key_event(KeyCode::Char('k')));
-
-        // An update without GPS time must not fire the (real) clock sync
-        app.handle_gpsd_event(GpsdEvent::Update(Box::default()));
         assert!(app.armed_clock_set);
+        app
+    }
+
+    #[test]
+    fn test_timing_clock_sync_stays_armed_without_gps_time() {
+        let mut app = armed_app();
+        // A TPV without time must not queue a clock sync
+        app.handle_gpsd_event(json_event(
+            r#"{"class":"TPV","mode":3,"lat":1.0,"lon":2.0}"#,
+            now(),
+        ));
+        assert!(app.armed_clock_set);
+        assert!(app.pending_clock_sync.is_none());
+    }
+
+    #[test]
+    fn test_clock_sync_ignores_non_tpv_messages() {
+        let mut app = armed_app();
+        let t = now();
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", t));
+        // Consume the first trigger, re-arm, then send only non-TPV traffic
+        app.pending_clock_sync = None;
+        app.handle_event(key_event(KeyCode::Char('k')));
+        for line in [
+            r#"{"class":"SKY","hdop":1.0}"#,
+            r#"{"class":"PPS","real_sec":1}"#,
+            r#"{"class":"TOFF","real_sec":1}"#,
+            r#"{"class":"DEVICE","path":"/dev/x"}"#,
+        ] {
+            app.handle_gpsd_event(json_event(line, t + 0.5));
+        }
+        assert!(app.armed_clock_set);
+        assert!(app.pending_clock_sync.is_none());
+    }
+
+    #[test]
+    fn test_clock_sync_requires_fix() {
+        let mut app = armed_app();
+        app.handle_gpsd_event(json_event(
+            r#"{"class":"TPV","mode":1,"time":"2024-01-15T12:30:00.000Z"}"#,
+            now(),
+        ));
+        assert!(app.armed_clock_set);
+        assert!(app.pending_clock_sync.is_none());
+    }
+
+    #[test]
+    fn test_clock_sync_requires_fresh_tpv_time() {
+        let mut app = new_app();
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", now()));
+        app.active_tab = ActiveTab::Timing;
+        app.handle_event(key_event(KeyCode::Char('k')));
+        // Repeated TPV for the same epoch is not fresh
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", now()));
+        assert!(app.pending_clock_sync.is_none());
+        assert!(app.armed_clock_set);
+    }
+
+    #[test]
+    fn test_clock_sync_queued_on_fresh_fix_with_tpv_receipt() {
+        let mut app = armed_app();
+        let t = now();
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.123Z", t));
+        // Later non-TPV traffic must not change the receipt time used
+        app.handle_gpsd_event(json_event(r#"{"class":"PPS"}"#, t + 0.7));
+        assert!(!app.armed_clock_set);
+        assert_eq!(
+            app.pending_clock_sync,
+            Some(ClockSyncRequest {
+                gps_time: "2024-01-15T12:30:00.123Z".to_string(),
+                tpv_receipt: t,
+            })
+        );
+        assert!(app.status_message.contains("Clock sync"));
+    }
+
+    #[test]
+    fn test_ctrl_c_quits_globally() {
+        // On NMEA tab: quits and does not clear the buffer
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Nmea;
+        app.nmea_buffer.push_back("$GPGGA".to_string());
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.nmea_buffer.len(), 1);
+
+        // On Timing tab: quits and keeps TOFF samples
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        app.gps_data.toff_samples = vec![1.0];
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.gps_data.toff_samples.len(), 1);
+
+        // With settings open (even while editing)
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.settings_editing);
+        app.handle_event(key_event_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert_eq!(app.settings_edit_buf, "localhost");
     }
 
     #[test]
@@ -1557,7 +1931,7 @@ mod tests {
 
         // 'a' on Dashboard should not arm TOFF
         app.handle_event(key_event(KeyCode::Char('a')));
-        assert!(!app.armed_toff.load(Ordering::SeqCst));
+        assert!(!app.armed_toff);
     }
 
     // === Staleness detection ===
@@ -1565,10 +1939,7 @@ mod tests {
     #[test]
     fn test_staleness() {
         let mut app = new_app();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = now();
 
         // Recent data - not stale
         app.gps_data.last_seen = now;
@@ -1582,56 +1953,176 @@ mod tests {
         assert!(app.stale_seconds > 10.0);
     }
 
-    // === GPS event handling ===
-
     #[test]
-    fn test_gpsd_update_clears_stale() {
+    fn test_staleness_uses_tpv_age_not_pps() {
         let mut app = new_app();
-        app.stale = true;
-        app.stale_seconds = 15.0;
+        let t0 = 1_000_000.0;
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", t0));
+        // PPS keeps arriving, TPVs have stopped
+        for i in 1..=15 {
+            app.handle_gpsd_event(json_event(r#"{"class":"PPS"}"#, t0 + i as f64));
+        }
+        app.update_staleness(t0 + 15.0);
+        assert!(app.stale);
+        assert!((app.stale_seconds - 15.0).abs() < 1e-9);
 
-        app.handle_gpsd_event(GpsdEvent::Update(Box::default()));
+        // A new TPV clears it
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:16Z", t0 + 16.0));
+        assert!(!app.stale);
+        app.update_staleness(t0 + 17.0);
         assert!(!app.stale);
         assert_eq!(app.stale_seconds, 0.0);
     }
 
     #[test]
+    fn test_non_tpv_message_does_not_clear_stale() {
+        let mut app = new_app();
+        app.stale = true;
+        app.stale_seconds = 15.0;
+        app.handle_gpsd_event(json_event(r#"{"class":"SKY"}"#, now()));
+        assert!(app.stale);
+    }
+
+    // === GPS event handling ===
+
+    #[test]
+    fn test_gpsd_tpv_clears_stale() {
+        let mut app = new_app();
+        app.stale = true;
+        app.stale_seconds = 15.0;
+
+        app.handle_gpsd_event(json_event(r#"{"class":"TPV","mode":1}"#, now()));
+        assert!(!app.stale);
+        assert_eq!(app.stale_seconds, 0.0);
+        assert!(app.gps_data.connected);
+    }
+
+    #[test]
+    fn test_message_applies_in_place() {
+        let mut app = new_app();
+        app.handle_gpsd_event(json_event(
+            r#"{"class":"SKY","hdop":0.9,"satellites":[{"PRN":3,"used":true}]}"#,
+            1.0,
+        ));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", 2.0));
+        // TPV does not disturb SKY-derived state
+        assert!((app.gps_data.dop.hdop - 0.9).abs() < 1e-10);
+        assert_eq!(app.gps_data.satellites.len(), 1);
+        assert_eq!(app.gps_data.last_tpv, 2.0);
+    }
+
+    #[test]
+    fn test_gpsd_error_class_sets_status() {
+        let mut app = new_app();
+        app.handle_gpsd_event(json_event(
+            r#"{"class":"ERROR","message":"unrecognized request"}"#,
+            1.0,
+        ));
+        assert!(app.status_message.contains("unrecognized request"));
+    }
+
+    #[test]
+    fn test_connected_resets_gps_data_but_keeps_toff() {
+        let mut app = new_app();
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", now()));
+        app.gps_data.toff_samples = vec![0.1];
+        app.handle_gpsd_event(GpsdEvent::Error("closed".to_string()));
+        assert!(!app.gps_data.connected);
+
+        app.handle_gpsd_event(GpsdEvent::Connected);
+        assert!(app.gps_data.connected);
+        assert!(app.gps_data.error_message.is_empty());
+        assert!(app.gps_data.latitude.is_nan());
+        assert_eq!(app.gps_data.toff_samples, vec![0.1]);
+    }
+
+    #[test]
+    fn test_reconnect_discards_stale_generation_events() {
+        let mut app = new_app();
+        assert!(app.handle_tagged_event((0, GpsdEvent::Connected)));
+
+        let generation = app.begin_reconnect();
+        assert_eq!(generation, 1);
+        assert_eq!(app.gps_data.error_message, "Reconnecting...");
+
+        // Events still queued from the aborted task must be ignored
+        assert!(!app.handle_tagged_event((0, tpv("2024-01-15T12:30:00Z", now()))));
+        assert!(!app.handle_tagged_event((0, GpsdEvent::Connected)));
+        assert!(!app.gps_data.connected);
+        assert_eq!(app.gps_data.error_message, "Reconnecting...");
+        assert!(app.gps_data.latitude.is_nan());
+
+        // Events from the new task are applied
+        assert!(app.handle_tagged_event((1, GpsdEvent::Connected)));
+        assert!(app.gps_data.connected);
+    }
+
+    // === Position hold ===
+
+    #[test]
+    fn test_hold_samples_only_new_tpvs() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('h')));
+        let t = now();
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", t));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:01Z", t + 1.0));
+        // Non-TPV traffic while the fix is still valid
+        for line in [
+            r#"{"class":"SKY","hdop":1.0}"#,
+            r#"{"class":"PPS"}"#,
+            r#"{"class":"TOFF"}"#,
+        ] {
+            app.handle_gpsd_event(json_event(line, t + 1.5));
+        }
+        // Duplicate TPV for the same epoch
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:01Z", t + 1.6));
+        assert_eq!(hold_count(&app), 2);
+
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:02Z", t + 2.0));
+        assert_eq!(hold_count(&app), 3);
+    }
+
+    #[test]
+    fn test_hold_toggle_feedback() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(app.status_message.contains("started"));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", 1.0));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:01Z", 2.0));
+        app.handle_event(key_event(KeyCode::Char('h')));
+        assert!(
+            app.status_message.contains("2 fixes"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    // === TOFF ===
+
+    #[test]
     fn test_toff_accumulation_in_app() {
         let mut app = new_app();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-
-        // Send update with GPS time
-        let data = GPSData {
-            time: "2024-01-15T12:30:00.000Z".to_string(),
-            last_seen: now,
-            connected: true,
-            ..Default::default()
-        };
-        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
-
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", now()));
         assert_eq!(app.gps_data.toff_samples.len(), 1);
+    }
+
+    #[test]
+    fn test_toff_uses_tpv_receipt_time() {
+        let mut app = new_app();
+        // 2024-01-15T12:30:00Z = 1705321800
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", 1_705_321_800.25));
+        assert!((app.gps_data.toff_samples[0] + 0.25).abs() < 1e-6);
     }
 
     #[test]
     fn test_toff_circular_buffer_in_app() {
         let mut app = new_app();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = now();
 
         // Send 25 updates to overflow the 20-element buffer
         for i in 0..25 {
-            let data = GPSData {
-                time: format!("2024-01-15T12:30:{:02}.000Z", i % 60),
-                last_seen: now + i as f64,
-                connected: true,
-                ..Default::default()
-            };
-            app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+            let time = format!("2024-01-15T12:30:{:02}.000Z", i % 60);
+            app.handle_gpsd_event(tpv(&time, now + i as f64));
         }
 
         assert_eq!(app.gps_data.toff_samples.len(), 20); // capped
@@ -1641,26 +2132,15 @@ mod tests {
     fn test_toff_arm_and_capture() {
         let mut app = new_app();
         app.active_tab = ActiveTab::Timing;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
 
         // Arm the TOFF
         app.handle_event(key_event(KeyCode::Char('a')));
-        assert!(app.armed_toff.load(Ordering::SeqCst));
+        assert!(app.armed_toff);
 
-        // Send a GPS update with time
-        let data = GPSData {
-            time: "2024-01-15T12:30:00.000Z".to_string(),
-            last_seen: now,
-            connected: true,
-            ..Default::default()
-        };
-        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", now()));
 
         // Armed TOFF should have fired
-        assert!(!app.armed_toff.load(Ordering::SeqCst));
+        assert!(!app.armed_toff);
         assert!(app.gps_data.toff_armed_offset.is_finite());
         assert_eq!(app.gps_data.toff_armed_gps_time, "2024-01-15T12:30:00.000Z");
         assert!(app.status_message.contains("captured"));
@@ -1670,33 +2150,20 @@ mod tests {
     fn test_toff_clear_persists_across_updates() {
         let mut app = new_app();
         app.active_tab = ActiveTab::Timing;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
+        let now = now();
 
         // Accumulate some TOFF data
-        let data = GPSData {
-            time: "2024-01-15T12:30:00.000Z".to_string(),
-            last_seen: now,
-            connected: true,
-            ..Default::default()
-        };
-        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00.000Z", now));
         assert!(!app.gps_data.toff_samples.is_empty());
 
         // Clear it
         app.handle_event(key_event(KeyCode::Char('c')));
         assert!(app.gps_data.toff_samples.is_empty());
 
-        // Send another update WITHOUT time — toff_samples should stay empty
-        let data2 = GPSData {
-            connected: true,
-            last_seen: now + 1.0,
-            ..Default::default()
-        };
-        app.handle_gpsd_event(GpsdEvent::Update(Box::new(data2)));
-        assert!(app.gps_data.toff_samples.is_empty()); // preserved!
+        // Further non-TPV traffic and a timeless TPV keep it empty
+        app.handle_gpsd_event(json_event(r#"{"class":"SKY"}"#, now + 0.5));
+        app.handle_gpsd_event(json_event(r#"{"class":"TPV","mode":1}"#, now + 1.0));
+        assert!(app.gps_data.toff_samples.is_empty());
     }
 
     #[test]
@@ -1707,5 +2174,105 @@ mod tests {
         app.handle_gpsd_event(GpsdEvent::Error("connection refused".to_string()));
         assert!(!app.gps_data.connected);
         assert_eq!(app.gps_data.error_message, "connection refused");
+    }
+
+    // === Feedback / misc ===
+
+    #[test]
+    fn test_logging_status_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(app.status_message.starts_with("Logging to "));
+        assert!(app.status_message.contains("tuigps_"));
+
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", 1.0));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:01Z", 2.0));
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(
+            app.status_message.contains("2 points"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn test_logging_start_failure_reported() {
+        let mut app = new_app();
+        app.log_dir = PathBuf::from("/nonexistent/definitely/not/here");
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(app.logger.is_none());
+        assert!(app.status_message.contains("Failed to start logging"));
+    }
+
+    #[test]
+    fn test_stop_logging_on_quit_closes_gpx() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
+        app.handle_event(key_event(KeyCode::Char('l')));
+        let filename = app.logger.as_ref().unwrap().filename.clone();
+        app.handle_event(key_event(KeyCode::Char('q')));
+        assert!(app.should_quit);
+        // What run() does after the loop exits
+        app.stop_logging();
+        assert!(app.logger.is_none());
+        let contents = std::fs::read_to_string(&filename).unwrap();
+        assert!(contents.trim_end().ends_with("</gpx>"));
+    }
+
+    #[test]
+    fn test_maps_without_fix_reports() {
+        let mut app = new_app();
+        assert!(app.maps_url().is_none());
+        app.handle_event(key_event(KeyCode::Char('m')));
+        assert!(app.status_message.contains("No fix"));
+
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", 1.0));
+        assert_eq!(
+            app.maps_url().as_deref(),
+            Some("https://www.google.com/maps?q=51.5,-0.1")
+        );
+    }
+
+    #[test]
+    fn test_output_log_capped() {
+        let mut dc = DeviceConfigState::new();
+        for i in 0..(OUTPUT_LOG_MAX + 50) {
+            dc.push_log(format!("line {i}"));
+        }
+        assert_eq!(dc.output_log.len(), OUTPUT_LOG_MAX);
+        assert_eq!(dc.output_log[0], "line 50");
+        assert_eq!(
+            dc.output_log.last().unwrap(),
+            &format!("line {}", OUTPUT_LOG_MAX + 49)
+        );
+    }
+
+    // === Frame limiter ===
+
+    #[test]
+    fn test_frame_limiter_coalesces_data_redraws() {
+        let mut f = FrameLimiter::new();
+        let t0 = Instant::now();
+        assert!(f.should_draw(t0)); // first frame
+        f.drew(t0);
+        assert!(!f.should_draw(t0));
+        assert!(f.deadline().is_none());
+
+        f.mark_dirty();
+        assert!(!f.should_draw(t0 + Duration::from_millis(10)));
+        assert_eq!(f.deadline(), Some(t0 + FRAME_INTERVAL));
+        assert!(f.should_draw(t0 + FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn test_frame_limiter_urgent_draws_immediately() {
+        let mut f = FrameLimiter::new();
+        let t0 = Instant::now();
+        f.drew(t0);
+        f.mark_urgent();
+        assert!(f.should_draw(t0 + Duration::from_millis(1)));
     }
 }

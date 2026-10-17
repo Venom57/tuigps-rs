@@ -161,7 +161,10 @@ pub struct VersionInfo {
 pub struct GPSData {
     // Connection state
     pub connected: bool,
+    /// Local receipt time (unix seconds) of the last message of any class.
     pub last_seen: f64,
+    /// Local receipt time (unix seconds) of the last TPV message.
+    pub last_tpv: f64,
     pub error_message: String,
 
     // TPV
@@ -212,6 +215,7 @@ impl Default for GPSData {
         Self {
             connected: false,
             last_seen: 0.0,
+            last_tpv: 0.0,
             error_message: String::new(),
 
             latitude: f64::NAN,
