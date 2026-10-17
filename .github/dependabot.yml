@@ -9,3 +9,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The MSRV job pins dtolnay/rust-toolchain@1.88 on purpose; the ref is
+      # the Rust version, not the action's version.
+      - dependency-name: dtolnay/rust-toolchain
