@@ -22,4 +22,5 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ];
 
     f.render_widget(Paragraph::new(lines), inner);
+    super::mark_data_state(f, area, app);
 }

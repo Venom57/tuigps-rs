@@ -27,13 +27,35 @@ pub const GNSS_SHORT: &[(u8, &str)] = &[
 pub const GNSS_COLORS: &[(u8, Color)] = &[
     (0, Color::Green),
     (1, Color::Yellow),
-    (2, Color::Blue),
+    // LightBlue rather than Blue: ANSI blue is nearly invisible on black.
+    (2, Color::LightBlue),
     (3, Color::Red),
     (4, Color::Magenta),
     (5, Color::LightCyan),
     (6, Color::Cyan),
     (7, Color::LightMagenta),
 ];
+
+/// Single-letter constellation code (RINEX style) so constellation can be
+/// identified without relying on color alone.
+pub const GNSS_LETTERS: &[(u8, char)] = &[
+    (0, 'G'),
+    (1, 'S'),
+    (2, 'E'),
+    (3, 'C'),
+    (4, 'M'),
+    (5, 'J'),
+    (6, 'R'),
+    (7, 'I'),
+];
+
+pub fn gnss_letter(id: u8) -> char {
+    GNSS_LETTERS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, c)| *c)
+        .unwrap_or('?')
+}
 
 pub fn gnss_name(id: u8) -> &'static str {
     GNSS_NAMES
@@ -56,7 +78,7 @@ pub fn gnss_color(id: u8) -> Color {
         .iter()
         .find(|(i, _)| *i == id)
         .map(|(_, c)| *c)
-        .unwrap_or(Color::White)
+        .unwrap_or(Color::Reset)
 }
 
 pub fn mode_name(mode: FixMode) -> &'static str {
@@ -100,7 +122,7 @@ pub fn status_color(status: FixStatus) -> Color {
         FixStatus::RtkFloat => Color::LightCyan,
         FixStatus::Dr => Color::Yellow,
         FixStatus::GnssDr => Color::Yellow,
-        FixStatus::TimeOnly => Color::Blue,
+        FixStatus::TimeOnly => Color::LightBlue,
         FixStatus::Simulated => Color::Magenta,
         FixStatus::PpsFix => Color::Green,
     }
@@ -153,6 +175,15 @@ mod tests {
     fn test_gnss_short() {
         assert_eq!(gnss_short(0), "GP");
         assert_eq!(gnss_short(3), "BD");
+    }
+
+    #[test]
+    fn test_gnss_letter() {
+        assert_eq!(gnss_letter(0), 'G');
+        assert_eq!(gnss_letter(2), 'E');
+        assert_eq!(gnss_letter(3), 'C');
+        assert_eq!(gnss_letter(6), 'R');
+        assert_eq!(gnss_letter(99), '?');
     }
 
     #[test]

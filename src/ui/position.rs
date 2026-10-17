@@ -16,16 +16,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(vec![
             Span::raw("Lat: "),
-            Span::styled(
-                fmt_coord(data.latitude, "lat", cf),
-                Style::default().fg(Color::White).bold(),
-            ),
+            Span::styled(fmt_coord(data.latitude, "lat", cf), Style::default().bold()),
         ]),
         Line::from(vec![
             Span::raw("Lon: "),
             Span::styled(
                 fmt_coord(data.longitude, "lon", cf),
-                Style::default().fg(Color::White).bold(),
+                Style::default().bold(),
             ),
         ]),
         Line::from(format!("Alt HAE: {}", fmt_altitude(data.alt_hae, unit))),
@@ -54,6 +51,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+    super::mark_data_state(f, area, app);
 }
 
 fn cep_color(cep: f64) -> Color {
