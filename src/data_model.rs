@@ -278,10 +278,12 @@ impl GPSData {
             && self.longitude.is_finite()
     }
 
-    /// PPS offset in microseconds
+    /// PPS offset in microseconds. Differences are taken in i128 so
+    /// out-of-range values from a malformed PPS message cannot overflow.
     pub fn pps_offset_us(&self) -> f64 {
-        let offset_sec = (self.pps.real_sec - self.pps.clock_sec) as f64
-            + (self.pps.real_nsec - self.pps.clock_nsec) as f64 / 1e9;
+        let diff = |a: i64, b: i64| (i128::from(a) - i128::from(b)) as f64;
+        let offset_sec = diff(self.pps.real_sec, self.pps.clock_sec)
+            + diff(self.pps.real_nsec, self.pps.clock_nsec) / 1e9;
         offset_sec * 1e6
     }
 }
@@ -434,5 +436,19 @@ mod tests {
         d.pps.clock_nsec = 0;
         let offset = d.pps_offset_us();
         assert!((offset - 0.5).abs() < 1e-6); // 500ns = 0.5us
+    }
+
+    #[test]
+    fn test_pps_offset_us_extreme_values_do_not_overflow() {
+        // Values a malformed PPS message can carry; used to panic in debug
+        // builds with "attempt to subtract with overflow".
+        let mut d = GPSData::default();
+        d.pps.real_sec = i64::MAX;
+        d.pps.clock_sec = i64::MIN;
+        d.pps.real_nsec = i64::MIN;
+        d.pps.clock_nsec = i64::MAX;
+        let offset = d.pps_offset_us();
+        assert!(offset.is_finite());
+        assert!(offset > 1e24); // ~1.8e19 s
     }
 }

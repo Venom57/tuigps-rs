@@ -1,0 +1,5 @@
+{"class":"VERSION","release":"3.22","rev":"3.22","proto_major":3,"proto_minor":14}
+{"class":"TPV","device":"/dev/ttyS0","mode":3,"time":"2024-05-12T14:05:05.000Z","lat":48.858370,"lon":2.294481,"altMSL":35.0}
+$GPGGA,140505.00,4851.50220,N,00217.66886,E,1,08,0.9,35.0,M,46.9,M,,*68
+
+{"class":"SKY","device":"/dev/ttyS0","hdop":1.25,"satellites":[{"PRN":3,"el":12.0,"az":88.0,"ss":27.0,"used":true,"gnssid":0,"svid":3}]}

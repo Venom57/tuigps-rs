@@ -258,6 +258,13 @@ fn json_f64(msg: &Value, key: &str) -> f64 {
     msg[key].as_f64().unwrap_or(f64::NAN)
 }
 
+/// Integer field `key` as `T`, or `None` if it is absent, not an integer, or
+/// out of range for `T`. Out-of-range values are never silently truncated
+/// (e.g. `"mode":259` must not become mode 3).
+fn json_int<T: TryFrom<i64>>(msg: &Value, key: &str) -> Option<T> {
+    msg[key].as_i64().and_then(|v| T::try_from(v).ok())
+}
+
 /// Overwrite `target` only if `key` is present as a number.
 fn set_if_present(msg: &Value, key: &str, target: &mut f64) {
     if let Some(v) = msg[key].as_f64() {
@@ -266,8 +273,8 @@ fn set_if_present(msg: &Value, key: &str, target: &mut f64) {
 }
 
 fn extract_tpv(msg: &Value, data: &mut GPSData) {
-    data.mode = FixMode::from(msg["mode"].as_u64().unwrap_or(0) as u8);
-    data.status = FixStatus::from(msg["status"].as_u64().unwrap_or(0) as u8);
+    data.mode = FixMode::from(json_int::<u8>(msg, "mode").unwrap_or(0));
+    data.status = FixStatus::from(json_int::<u8>(msg, "status").unwrap_or(0));
 
     data.latitude = json_f64(msg, "lat");
     data.longitude = json_f64(msg, "lon");
@@ -280,7 +287,7 @@ fn extract_tpv(msg: &Value, data: &mut GPSData) {
     data.magtrack = json_f64(msg, "magtrack");
     data.magvar = json_f64(msg, "magvar");
 
-    data.leapseconds = msg["leapseconds"].as_i64().unwrap_or(0) as i32;
+    data.leapseconds = json_int(msg, "leapseconds").unwrap_or(0);
 
     // Error estimates
     data.errors.eph = json_f64(msg, "eph");
@@ -320,19 +327,21 @@ fn extract_sky(msg: &Value, data: &mut GPSData) {
 
     // An explicit (possibly empty) array replaces the list; absent keeps it.
     if let Some(sats) = msg["satellites"].as_array() {
+        // Non-object entries are skipped rather than turned into PRN 0.
         data.satellites = sats
             .iter()
+            .filter(|s| s.is_object())
             .map(|s| SatelliteInfo {
-                prn: s["PRN"].as_u64().unwrap_or(0) as u16,
-                gnssid: s["gnssid"].as_u64().unwrap_or(0) as u8,
-                svid: s["svid"].as_u64().unwrap_or(0) as u16,
+                prn: json_int(s, "PRN").unwrap_or(0),
+                gnssid: json_int(s, "gnssid").unwrap_or(0),
+                svid: json_int(s, "svid").unwrap_or(0),
                 elevation: json_f64(s, "el"),
                 azimuth: json_f64(s, "az"),
                 snr: json_f64(s, "ss"),
                 used: s["used"].as_bool().unwrap_or(false),
-                sigid: s["sigid"].as_u64().unwrap_or(0) as u8,
-                health: s["health"].as_u64().unwrap_or(0) as u8,
-                freqid: s["freqid"].as_i64().map(|v| v as i8),
+                sigid: json_int(s, "sigid").unwrap_or(0),
+                health: json_int(s, "health").unwrap_or(0),
+                freqid: json_int(s, "freqid"),
             })
             .collect();
         data.satellites_used = data.satellites.iter().filter(|s| s.used).count() as u32;
@@ -344,7 +353,7 @@ fn extract_pps(msg: &Value, data: &mut GPSData) {
     data.pps.real_nsec = msg["real_nsec"].as_i64().unwrap_or(0);
     data.pps.clock_sec = msg["clock_sec"].as_i64().unwrap_or(0);
     data.pps.clock_nsec = msg["clock_nsec"].as_i64().unwrap_or(0);
-    data.pps.precision = msg["precision"].as_i64().unwrap_or(0) as i32;
+    data.pps.precision = json_int(msg, "precision").unwrap_or(0);
     data.pps.qerr = msg["qErr"].as_i64().unwrap_or(0);
 }
 
@@ -378,16 +387,16 @@ fn extract_device_fields(msg: &Value, data: &mut GPSData) {
     if let Some(v) = msg["subtype"].as_str() {
         data.device.subtype = v.to_string();
     }
-    if let Some(v) = msg["bps"].as_u64() {
-        data.device.bps = v as u32;
+    if let Some(v) = json_int(msg, "bps") {
+        data.device.bps = v;
     }
     set_if_present(msg, "cycle", &mut data.device.cycle);
     set_if_present(msg, "mincycle", &mut data.device.mincycle);
     if let Some(v) = msg["activated"].as_str() {
         data.device.activated = v.to_string();
     }
-    if let Some(v) = msg["native"].as_u64() {
-        data.device.native = v as u8;
+    if let Some(v) = json_int(msg, "native") {
+        data.device.native = v;
     }
 }
 
@@ -395,8 +404,8 @@ fn extract_version(msg: &Value, data: &mut GPSData) {
     if let Some(v) = msg["release"].as_str() {
         data.version.release = v.to_string();
     }
-    data.version.proto_major = msg["proto_major"].as_u64().unwrap_or(0) as u32;
-    data.version.proto_minor = msg["proto_minor"].as_u64().unwrap_or(0) as u32;
+    data.version.proto_major = json_int(msg, "proto_major").unwrap_or(0);
+    data.version.proto_minor = json_int(msg, "proto_minor").unwrap_or(0);
 }
 
 #[cfg(test)]
@@ -527,6 +536,19 @@ mod tests {
     }
 
     #[test]
+    fn test_non_object_satellite_entries_skipped() {
+        let mut data = GPSData::default();
+        apply_line(
+            r#"{"class":"SKY","satellites":[1,"x",null,[],{"PRN":9,"used":true}]}"#,
+            &mut data,
+            1.0,
+        );
+        assert_eq!(data.satellites.len(), 1);
+        assert_eq!(data.satellites[0].prn, 9);
+        assert_eq!(data.satellites_used, 1);
+    }
+
+    #[test]
     fn test_extract_pps() {
         let mut data = GPSData::default();
         let msg: Value = serde_json::from_str(
@@ -600,6 +622,60 @@ mod tests {
         assert_eq!(data.device.bps, 9600);
         assert!((data.device.cycle - 1.0).abs() < 1e-10);
         assert_eq!(data.device.activated, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_out_of_range_integers_are_not_truncated() {
+        let mut data = GPSData::default();
+        // 259 = 256 + 3, 4294967314 = 2^32 + 18: used to wrap to a 3D fix
+        // with 18 leap seconds.
+        apply_line(
+            r#"{"class":"TPV","mode":259,"status":257,"lat":1.0,"lon":2.0,"leapseconds":4294967314}"#,
+            &mut data,
+            1.0,
+        );
+        assert_eq!(data.mode, FixMode::Unknown);
+        assert_eq!(data.status, FixStatus::Unknown);
+        assert_eq!(data.leapseconds, 0);
+        assert!(!data.has_fix());
+
+        apply_line(
+            r#"{"class":"SKY","satellites":[{"PRN":70000,"svid":65537,"gnssid":300,"sigid":-1,"health":999,"freqid":200}]}"#,
+            &mut data,
+            2.0,
+        );
+        let s = &data.satellites[0];
+        assert_eq!(
+            (s.prn, s.svid, s.gnssid, s.sigid, s.health),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(s.freqid, None);
+
+        // -(2^32) - 20 used to wrap to -20
+        apply_line(r#"{"class":"PPS","precision":-4294967316}"#, &mut data, 3.0);
+        assert_eq!(data.pps.precision, 0);
+
+        // Out-of-range DEVICE fields keep the previous value
+        apply_line(
+            r#"{"class":"DEVICE","bps":9600,"native":1}"#,
+            &mut data,
+            4.0,
+        );
+        apply_line(
+            r#"{"class":"DEVICE","bps":4294967396,"native":300}"#,
+            &mut data,
+            5.0,
+        );
+        assert_eq!(data.device.bps, 9600);
+        assert_eq!(data.device.native, 1);
+
+        apply_line(
+            r#"{"class":"VERSION","proto_major":4294967299,"proto_minor":-1}"#,
+            &mut data,
+            6.0,
+        );
+        assert_eq!(data.version.proto_major, 0);
+        assert_eq!(data.version.proto_minor, 0);
     }
 
     #[test]
