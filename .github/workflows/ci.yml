@@ -35,6 +35,9 @@ jobs:
       - run: cargo clippy --all-targets --locked ${{ matrix.features }}
       - run: cargo test --all-targets --locked ${{ matrix.features }}
       - run: cargo build --release --locked ${{ matrix.features }}
+      - run: cargo doc --no-deps --locked ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
   msrv:
     name: msrv (1.88)

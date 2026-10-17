@@ -460,7 +460,13 @@ enum CmdError {
 async fn run_command(program: &str, args: &[String]) -> Result<Output, CmdError> {
     match tokio::time::timeout(
         DEVICE_CMD_TIMEOUT,
-        tokio::process::Command::new(program).args(args).output(),
+        // kill_on_drop: if the timeout fires, dropping the future kills the
+        // child instead of leaving it running against the receiver
+        tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     {

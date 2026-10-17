@@ -12,7 +12,7 @@ pub enum SettingsField {
     Port,
     Units,
     CoordFormat,
-    /// The "[ Save ]" button: Enter applies like Ctrl+S.
+    /// The "\[ Save \]" button: Enter applies like Ctrl+S.
     Save,
 }
 
