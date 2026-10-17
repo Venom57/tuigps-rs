@@ -102,9 +102,9 @@ Confirmations / new findings from tooling:
 
 ### High
 - [x] **U1. Connection badge truncated off footer** — `status_bar.rs:13-27,116-150`. ~65 cols of global hints render first; at 80 cols on NMEA/Device tabs, CONNECTED/DISCONNECTED/STALE never appears. Fix: right-anchored chunk for status + REC/HOLD; move long hints to a `?` help overlay.
-- [~] **U2. Stale values shown at full brightness when disconnected** — `GpsdEvent::Error` (`app.rs:411-414`) and reconnect only clear `connected`. Dim panels / show "NO DATA" when disconnected or stale; show fix age.
+- [x] **U2. Stale values shown at full brightness when disconnected** — `GpsdEvent::Error` (`app.rs:411-414`) and reconnect only clear `connected`. Dim panels / show "NO DATA" when disconnected or stale; show fix age.
 - [x] **U3. Settings help text invisible** — `settings.rs:12` background `DarkGray`; hints/descriptions also `DarkGray` (`:79-91,130,154-155`). Negates the last commit's work.
-- [ ] **U4. Dangerous device actions without confirmation** — `app.rs:697,741-789`
+- [x] **U4. Dangerous device actions without confirmation** — `app.rs:697,741-789`
   - Enter immediately runs ubxtool (baud change can sever link, disable GNSS, save to flash).
   - Controls initialize from hard-coded defaults (`app.rs:176-188`: 9600 baud, all constellations `[x]`), not the receiver's actual config.
   - `[x]`/`[ ]` flip before apply → pending vs applied indistinguishable.
@@ -112,19 +112,19 @@ Confirmations / new findings from tooling:
 - [x] **U5. Mouse capture enabled but unused** — `main.rs:46`. Blocks terminal text selection (can't copy coordinates). Remove, or implement click-to-tab + wheel scroll.
 
 ### Medium
-- [~] **U6. Dashboard clips data at 80×24 with no indication** — fixed 3/5/2 ratios (`dashboard.rs:8-12`). Fix panel loses PDOP/GDOP; Position loses MSL/geoid/hold CEP (`position.rs:36-53`); Errors shows 2 of 7 rows. Use `Length`/`Min` constraints + "terminal too small" notice.
+- [x] **U6. Dashboard clips data at 80×24 with no indication** — fixed 3/5/2 ratios (`dashboard.rs:8-12`). Fix panel loses PDOP/GDOP; Position loses MSL/geoid/hold CEP (`position.rs:36-53`); Errors shows 2 of 7 rows. Use `Length`/`Min` constraints + "terminal too small" notice.
 - [x] **U7. Misleading placeholders** — PPS offset `+0.0 ns` with no PPS (`time_panel.rs:35`, `data_model.rs:278`); device cycle `0.0s`/`NaNs` (`device_panel.rs:14`); leap seconds `0`; satellite health 0 (unknown) shown as red "0" (`satellite_table.rs:44-53`).
-- [ ] **U8. Units only partially applied** — climb always m/s (`velocity.rs:30`); geoid, CEP, error estimates always meters (`position.rs:33,43,49`, `error_panel.rs`).
-- [ ] **U9. Settings not persisted** — add `~/.config/tuigps/config.toml` (host, port, units, coord format, theme).
-- [ ] **U10. Unbounded scroll offsets** — satellite Down / NMEA Up (`app.rs:620-631,669-677`) count past end; render clamps, so user must press the opposite key many times. NMEA offset is bottom-relative, so view drifts as lines arrive while scrolled.
-- [ ] **U11. Missing action feedback** — `l` logging gives no start/stop/error message, filename never shown (`app.rs:480-492`); `m` silently does nothing without fix (`:470-478`); `h` off silently discards hold stats — mean/count/duration/std computed but never displayed (`:494-500`).
+- [x] **U8. Units only partially applied** — climb always m/s (`velocity.rs:30`); geoid, CEP, error estimates always meters (`position.rs:33,43,49`, `error_panel.rs`).
+- [x] **U9. Settings not persisted** — add `~/.config/tuigps/config.toml` (host, port, units, coord format, theme).
+- [x] **U10. Unbounded scroll offsets** — satellite Down / NMEA Up (`app.rs:620-631,669-677`) count past end; render clamps, so user must press the opposite key many times. NMEA offset is bottom-relative, so view drifts as lines arrive while scrolled.
+- [x] **U11. Missing action feedback** — `l` logging gives no start/stop/error message, filename never shown (`app.rs:480-492`); `m` silently does nothing without fix (`:470-478`); `h` off silently discards hold stats — mean/count/duration/std computed but never displayed (`:494-500`).
 - [x] **U12. Color accessibility** — GPS green vs BeiDou red (`constants.rs:28-31`); sky plot distinguishes constellations by color only, no legend; red/yellow/green SNR/DOP/CEP; Galileo dark blue hard to read on black; `Color::White` values vanish on light themes; no `NO_COLOR` / monochrome; STALE badge white-on-yellow (`status_bar.rs:126`).
 
 ### Low
-- [ ] **U13.** Settings: Left and Right both cycle forward (`app.rs:574-580`); Port accepts letters, invalid value silently ignored; Esc after editing host keeps new value without reconnect.
+- [x] **U13.** Settings: Left and Right both cycle forward (`app.rs:574-580`); Port accepts letters, invalid value silently ignored; Esc after editing host keeps new value without reconnect.
 - [x] **U14.** Status message duplicated on Timing tab (`mod.rs:124-130`).
 - [x] **U15.** Satellite table subtracts 4 rows for chrome but uses 3 (`satellite_table.rs:13`); sort fixed to GNSS/PRN.
-- [ ] **U16.** No `1`–`5` tab shortcuts, no `?` help, Esc does nothing in main view.
+- [x] **U16.** No `1`–`5` tab shortcuts, no `?` help, Esc does nothing in main view.
 
 ### Feature ideas
 - `?` help overlay + compact footer.
@@ -155,12 +155,12 @@ Confirmations / new findings from tooling:
 - [x] **T0.** Split crate into `src/lib.rs` + thin `src/main.rs` so `tests/` can import modules.
 - [x] **T1.** Fix B8 (failing test) and B9 (test writes file; make logger output dir injectable, use `tempfile`).
 - [x] **T2. Render smoke tests** with `ratatui::backend::TestBackend`: `ui::render` and each panel at 0×0, 1×1, 10×3, 20×5, 40×12, 80×24, 200×60 with default and fully-populated `GPSData` (NaNs, 0 sats, 64 sats, SNR > 55, NMEA overflow). Then `insta` snapshots at 80×24.
-- [ ] **T3. gpsd fixtures** `tests/fixtures/*.jsonl` (real gpsd 3.2x): TPV, SKY (full/partial/empty), TOFF, PPS, DEVICES (0/1/2), WATCH, VERSION, ERROR, plus malformed (truncated, wrong types, huge PRN, 1 MB line, CRLF). Assert exact field values.
-- [ ] **T4. Mock gpsd server** (`#[tokio::test]`): `TcpListener` on `127.0.0.1:0`, verify `?WATCH`, stream fixtures, close → expect `Error` → reconnect after 2 s (`tokio::time::pause()`) → clean shutdown.
+- [x] **T3. gpsd fixtures** `tests/fixtures/*.jsonl` (real gpsd 3.2x): TPV, SKY (full/partial/empty), TOFF, PPS, DEVICES (0/1/2), WATCH, VERSION, ERROR, plus malformed (truncated, wrong types, huge PRN, 1 MB line, CRLF). Assert exact field values.
+- [x] **T4. Mock gpsd server** (`#[tokio::test]`): `TcpListener` on `127.0.0.1:0`, verify `?WATCH`, stream fixtures, close → expect `Error` → reconnect after 2 s (`tokio::time::pause()`) → clean shutdown.
 - [x] **T5. Logger output**: parse GPX with `quick-xml` after stop *and* drop; CSV via `csv` crate (header + N rows, empty fields not `NaN`, duplicate timestamps deduped).
 - [x] **T6. position_hold numerics**: two-pass reference for mean/std, B5/B6 regressions, CEP50 vs synthetic Gaussian.
-- [ ] **T7. `proptest`**: formatting never panics on any f64; `process_message` never panics on arbitrary input; renders never panic for any `Rect` < 300×100.
-- [ ] **T8. App state**: feed `GpsdEvent::Update`/`Nmea` into `App`, check staleness, NMEA buffer cap, hold accumulation, clock-sync arm flow, Ctrl+C.
+- [x] **T7. `proptest`**: formatting never panics on any f64; `process_message` never panics on arbitrary input; renders never panic for any `Rect` < 300×100.
+- [x] **T8. App state**: feed `GpsdEvent::Update`/`Nmea` into `App`, check staleness, NMEA buffer cap, hold accumulation, clock-sync arm flow, Ctrl+C.
 - [x] Add `[dev-dependencies]`: `insta`, `proptest`, `tempfile`, `quick-xml`, `csv`.
 
 ## 5. CI/CD & tooling
@@ -232,7 +232,7 @@ jobs:
 - [x] **C5.** `[lints]` table (e.g. `clippy::pedantic` warn, `unwrap_used` warn outside tests).
 - [x] **C6.** `deny.toml` (`cargo deny init`, allow-list licenses).
 - [x] **C7.** `.github/dependabot.yml` for `cargo` + `github-actions`.
-- [ ] **C8.** Optional pre-commit hook (`fmt --check` + `clippy`).
+- [x] **C8.** Optional pre-commit hook (`fmt --check` + `clippy`).
 - [x] **C9.** `.gitignore`: `*.csv` would hide CSV test fixtures — add `!tests/fixtures/**`; misleading "Cargo.lock optional" comment (lockfile should stay committed for a binary).
 
 ## 6. Documentation drift
@@ -245,14 +245,14 @@ jobs:
 
 ## 7. Architecture
 
-- [ ] **A1. Split `app.rs`** (1636 lines, ~600 tests) into:
+- [x] **A1. Split `app.rs`** (1636 lines, ~600 tests) into:
   - `app/device_config.rs` — `DeviceConfigState`, constants, `run_ubxtool`, `run_baud_rate_change` (duplicated output handling), `build_tp5_cmd` (~300 lines)
   - `app/settings.rs` — `SettingsField` + input handler
   - `app/nmea.rs` — buffers, pause/filter
   - `app/timing.rs` — TOFF + clock arming
   - `event_loop.rs` — `run`
   - Tests move with their modules.
-- [ ] **A2.** Move app-managed `toff_*` fields out of `GPSData` (`data_model.rs:200-203`) into an App-owned `TimingState`; removes the take/restore workaround at `app.rs:319-332`.
+- [x] **A2.** Move app-managed `toff_*` fields out of `GPSData` (`data_model.rs:200-203`) into an App-owned `TimingState`; removes the take/restore workaround at `app.rs:319-332`.
 - [x] **A3.** Per-class gpsd events (see P3).
 
 ---
@@ -266,7 +266,20 @@ jobs:
   - Core (`wb-core` merge): per-class gpsd events, TPV-gated hold/staleness/clock sync, non-blocking clock sync with NTP restore, 20 fps redraw cap, Ctrl+C, reconnect generation.
   - UI (`wb-ui` merge): status bar, settings contrast, NO DATA/STALE panels, placeholders, accessibility + NO_COLOR, render smoke tests.
   - End-to-end verified against a fake gpsd in tmux (dashboard, logging, disconnect, Ctrl+C, GPX well-formed).
-  - `[~]` = partial: U2 lacks fix-age display; U6 bottom row still tight at 80×24.
+- **2026-10-17 — Group 2 (parallel worktrees), merged:**
+  - Display: units everywhere, fix age, Hold panel, priority-based dashboard rows.
+  - Interaction: `?` help from one key table, `1`–`5` tabs, settings (←/→, port validation, Esc/Save semantics, auto-reconnect), TOML config file + `--config`, scroll clamping/anchoring, Device y/n confirmation + pending/applied markers.
+  - Tests: gpsd fixtures, mock-gpsd I/O (paused clock), App state, property tests, pre-commit hook; found and fixed 3 parser/model bugs (PPS overflow, integer truncation, phantom satellites).
+- **2026-10-17 — Group 3:** `app.rs` split into `src/app/` (10 modules), TOFF state moved to `TimingState`, shared device command execution.
+- **2026-10-17 — Integration:** out-of-range lat/lon rejected; hold progress count; timed-out device commands killed (`kill_on_drop`); rustdoc `-Dwarnings` in CI; README/CLAUDE.md updated; final E2E run against fake gpsd (help, hold, imperial, settings → config file, Ctrl+C).
+
+### Remaining / not done
+- Receiver config is never read back on the Device tab (pending/applied = sent, not confirmed).
+- `u` changes units for the session only (by design; Settings saves).
+- CSV logging still not selectable from the UI.
+- D-Bus clock sync still a stub; fractional-second `timedatectl`/`date` arguments not exercised on a real system.
+- No LICENSE file (README previously claimed MIT; `publish = false` set).
+- Feature ideas not started: OSC 52 copy, MGRS/UTM, sortable satellite table, sparklines, NMEA search/save, mouse support, GLONASS freqid display.
 
 ## Execution order
 
