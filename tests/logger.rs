@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::Event;
 use tuigps_rs::data_model::{DOPValues, FixMode, GPSData};
 use tuigps_rs::gps_logger::{CSV_HEADER, GpsLogger, LogFormat};
@@ -42,6 +43,12 @@ struct Gpx {
     points: Vec<TrkPt>,
 }
 
+/// True when the innermost open elements are `<trkpt><time>`.
+fn in_trkpt_time(stack: &[String]) -> bool {
+    stack.last().is_some_and(|n| n == "time")
+        && stack.iter().rev().nth(1).is_some_and(|n| n == "trkpt")
+}
+
 /// Parse a GPX file, failing the test if it is not well-formed XML (including
 /// unclosed elements at end of file).
 fn parse_gpx(path: &Path) -> Gpx {
@@ -54,14 +61,16 @@ fn parse_gpx(path: &Path) -> Gpx {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = String::from_utf8(e.name().as_ref().to_vec()).unwrap();
+                let name = e.name().as_ref().to_string();
                 let attrs: Vec<(String, String)> = e
                     .attributes()
                     .map(|a| {
                         let a = a.expect("valid attribute");
                         (
-                            String::from_utf8(a.key.as_ref().to_vec()).unwrap(),
-                            a.unescape_value().unwrap().into_owned(),
+                            a.key.as_ref().to_string(),
+                            a.normalized_value(XmlVersion::Implicit1_0)
+                                .unwrap()
+                                .into_owned(),
                         )
                     })
                     .collect();
@@ -89,14 +98,25 @@ fn parse_gpx(path: &Path) -> Gpx {
                 stack.push(name);
             }
             Ok(Event::Text(t)) => {
-                if stack.last().is_some_and(|n| n == "time")
-                    && stack.iter().rev().nth(1).is_some_and(|n| n == "trkpt")
-                {
-                    gpx.points.last_mut().unwrap().time = t.unescape().unwrap().into_owned();
+                if in_trkpt_time(&stack) {
+                    let time = &mut gpx.points.last_mut().unwrap().time;
+                    time.push_str(&t.xml_content(XmlVersion::Implicit1_0));
+                }
+            }
+            // quick-xml >= 0.38 reports entity references as separate events
+            Ok(Event::GeneralRef(r)) => {
+                if in_trkpt_time(&stack) {
+                    let resolved = match r.resolve_char_ref().expect("valid char ref") {
+                        Some(c) => c.to_string(),
+                        None => quick_xml::escape::resolve_predefined_entity(&r)
+                            .expect("predefined entity")
+                            .to_string(),
+                    };
+                    gpx.points.last_mut().unwrap().time.push_str(&resolved);
                 }
             }
             Ok(Event::End(e)) => {
-                let name = String::from_utf8(e.name().as_ref().to_vec()).unwrap();
+                let name = e.name().as_ref().to_string();
                 assert_eq!(stack.pop().as_deref(), Some(name.as_str()));
             }
             Ok(Event::Eof) => break,
