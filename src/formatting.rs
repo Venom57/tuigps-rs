@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_fmt_finite() {
-        assert_eq!(fmt(3.14159, 2, " m"), "3.14 m");
+        assert_eq!(fmt(1.23456, 2, " m"), "1.23 m");
         assert_eq!(fmt(0.0, 1, "°"), "0.0°");
     }
 

@@ -21,7 +21,7 @@ pub mod velocity;
 
 pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Length(1),  // tab bar
+        Constraint::Length(1), // tab bar
         Constraint::Min(0),    // main content
         Constraint::Length(1), // status bar
     ])
@@ -74,7 +74,7 @@ fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
 fn render_satellites(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // constellation summary (compact bar)
-        Constraint::Min(0),   // satellite table
+        Constraint::Min(0),    // satellite table
     ])
     .split(area);
 
@@ -106,7 +106,10 @@ fn render_toff_controls(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(" a ", Style::default().fg(Color::White).bg(Color::DarkGray)),
         if is_armed {
-            Span::styled(" ARMED ", Style::default().fg(Color::Black).bg(Color::Yellow))
+            Span::styled(
+                " ARMED ",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            )
         } else {
             Span::raw(" arm TOFF  ")
         },

@@ -1,10 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{
-    App, GNSS_NAMES_CONFIG, NAV_RATES, POWER_MODES, PPS_FREQUENCIES,
-    SERIAL_SPEEDS,
-};
+use crate::app::{App, GNSS_NAMES_CONFIG, NAV_RATES, POWER_MODES, PPS_FREQUENCIES, SERIAL_SPEEDS};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::vertical([

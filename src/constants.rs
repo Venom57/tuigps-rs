@@ -121,8 +121,8 @@ pub fn dop_rating(value: f64) -> (&'static str, Color) {
 }
 
 pub const COMPASS_POINTS: &[&str] = &[
-    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
-    "NW", "NNW",
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW",
+    "NNW",
 ];
 
 pub fn bearing_to_compass(degrees: f64) -> &'static str {

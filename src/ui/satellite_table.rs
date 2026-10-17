@@ -56,7 +56,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let scroll_info = if sats.len() > visible_height {
-        format!(" Satellites [{}-{}/{}] ", offset + 1, (offset + visible_sats.len()).min(sats.len()), sats.len())
+        format!(
+            " Satellites [{}-{}/{}] ",
+            offset + 1,
+            (offset + visible_sats.len()).min(sats.len()),
+            sats.len()
+        )
     } else {
         format!(" Satellites ({}) ", sats.len())
     };

@@ -1,18 +1,21 @@
 use anyhow::Result;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 
 use crate::data_model::GPSData;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LogFormat {
     Gpx,
+    #[allow(dead_code)] // not yet selectable from the UI
     Csv,
 }
 
 pub struct GpsLogger {
     file: Option<BufWriter<File>>,
     format: LogFormat,
+    dir: PathBuf,
     pub point_count: u32,
     last_time: String,
     pub active: bool,
@@ -20,10 +23,11 @@ pub struct GpsLogger {
 }
 
 impl GpsLogger {
-    pub fn new(format: LogFormat) -> Self {
+    pub fn new(format: LogFormat, dir: impl Into<PathBuf>) -> Self {
         Self {
             file: None,
             format,
+            dir: dir.into(),
             point_count: 0,
             last_time: String::new(),
             active: false,
@@ -60,6 +64,7 @@ impl GpsLogger {
             "tuigps_{}.gpx",
             chrono::Local::now().format("%Y%m%d_%H%M%S")
         );
+        let filename = self.dir.join(filename).to_string_lossy().into_owned();
         let mut file = BufWriter::new(File::create(&filename)?);
         writeln!(file, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
         writeln!(file, r#"<gpx version="1.0">"#)?;
@@ -76,6 +81,7 @@ impl GpsLogger {
             "tuigps_{}.csv",
             chrono::Local::now().format("%Y%m%d_%H%M%S")
         );
+        let filename = self.dir.join(filename).to_string_lossy().into_owned();
         let mut file = BufWriter::new(File::create(&filename)?);
         writeln!(file, "time,latitude,longitude,alt_msl,speed,track,climb")?;
         self.file = Some(file);
@@ -123,7 +129,12 @@ impl GpsLogger {
             writeln!(
                 file,
                 "{},{},{},{},{},{},{}",
-                data.time, data.latitude, data.longitude, data.alt_msl, data.speed, data.track,
+                data.time,
+                data.latitude,
+                data.longitude,
+                data.alt_msl,
+                data.speed,
+                data.track,
                 data.climb
             )?;
             self.point_count += 1;

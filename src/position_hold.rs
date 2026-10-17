@@ -11,6 +11,7 @@ pub struct PositionHold {
     start_time: Instant,
 }
 
+#[allow(dead_code)] // only cep50 is displayed so far
 pub struct HoldResult {
     pub mean_lat: f64,
     pub mean_lon: f64,

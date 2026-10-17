@@ -1,5 +1,3 @@
-use ratatui::prelude::*;
-
 use crate::app::App;
 use crate::ui::*;
 
@@ -18,11 +16,8 @@ pub fn render_dashboard(f: &mut Frame, area: Rect, app: &App) {
     ])
     .split(rows[0]);
 
-    let row2 = Layout::horizontal([
-        Constraint::Ratio(2, 3),
-        Constraint::Ratio(1, 3),
-    ])
-    .split(rows[1]);
+    let row2 =
+        Layout::horizontal([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]).split(rows[1]);
 
     let row3 = Layout::horizontal([
         Constraint::Ratio(1, 3),

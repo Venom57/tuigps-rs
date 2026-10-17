@@ -30,10 +30,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
 
     let lines = vec![
         Line::raw(""),
-        Line::styled(
-            "  Connection",
-            Style::default().fg(Color::White).bold(),
-        ),
+        Line::styled("  Connection", Style::default().fg(Color::White).bold()),
         render_field(
             "Host",
             if editing && sel == SettingsField::Host {
@@ -57,10 +54,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             "gpsd port (default 2947)",
         ),
         Line::raw(""),
-        Line::styled(
-            "  Display",
-            Style::default().fg(Color::White).bold(),
-        ),
+        Line::styled("  Display", Style::default().fg(Color::White).bold()),
         render_cycle_field(
             "Units",
             app.units.as_str(),
@@ -131,12 +125,7 @@ fn render_field<'a>(
     ])
 }
 
-fn render_cycle_field<'a>(
-    label: &str,
-    value: &str,
-    selected: bool,
-    description: &str,
-) -> Line<'a> {
+fn render_cycle_field<'a>(label: &str, value: &str, selected: bool, description: &str) -> Line<'a> {
     let marker = if selected { "> " } else { "  " };
     let value_style = if selected {
         Style::default().fg(Color::Yellow).bold()

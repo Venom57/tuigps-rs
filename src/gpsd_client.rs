@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,14 +44,16 @@ async fn connect_and_read(
     let (reader, mut writer) = stream.into_split();
 
     // Send WATCH command
-    let watch =
-        r#"?WATCH={"enable":true,"json":true,"pps":true,"timing":true,"nmea":true}"#;
+    let watch = r#"?WATCH={"enable":true,"json":true,"pps":true,"timing":true,"nmea":true}"#;
     writer.write_all(watch.as_bytes()).await?;
     writer.write_all(b"\n").await?;
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    let mut data = GPSData { connected: true, ..Default::default() };
+    let mut data = GPSData {
+        connected: true,
+        ..Default::default()
+    };
 
     loop {
         line.clear();
@@ -80,11 +82,7 @@ async fn connect_and_read(
     }
 }
 
-fn process_message(
-    line: &str,
-    data: &mut GPSData,
-    receipt_time: f64,
-) {
+fn process_message(line: &str, data: &mut GPSData, receipt_time: f64) {
     let msg: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return,
@@ -92,7 +90,7 @@ fn process_message(
     let class = msg["class"].as_str().unwrap_or("");
 
     match class {
-        "TPV" => extract_tpv(&msg, data, receipt_time),
+        "TPV" => extract_tpv(&msg, data),
         "SKY" => extract_sky(&msg, data),
         "PPS" => extract_pps(&msg, data),
         "TOFF" => extract_toff(&msg, data),
@@ -109,11 +107,7 @@ fn json_f64(msg: &Value, key: &str) -> f64 {
     msg[key].as_f64().unwrap_or(f64::NAN)
 }
 
-fn extract_tpv(
-    msg: &Value,
-    data: &mut GPSData,
-    receipt_time: f64,
-) {
+fn extract_tpv(msg: &Value, data: &mut GPSData) {
     data.mode = FixMode::from(msg["mode"].as_u64().unwrap_or(0) as u8);
     data.status = FixStatus::from(msg["status"].as_u64().unwrap_or(0) as u8);
 
@@ -165,24 +159,25 @@ fn extract_sky(msg: &Value, data: &mut GPSData) {
     data.dop.ydop = json_f64(msg, "ydop");
 
     if let Some(sats) = msg["satellites"].as_array()
-        && !sats.is_empty() {
-            data.satellites = sats
-                .iter()
-                .map(|s| SatelliteInfo {
-                    prn: s["PRN"].as_u64().unwrap_or(0) as u16,
-                    gnssid: s["gnssid"].as_u64().unwrap_or(0) as u8,
-                    svid: s["svid"].as_u64().unwrap_or(0) as u16,
-                    elevation: json_f64(s, "el"),
-                    azimuth: json_f64(s, "az"),
-                    snr: json_f64(s, "ss"),
-                    used: s["used"].as_bool().unwrap_or(false),
-                    sigid: s["sigid"].as_u64().unwrap_or(0) as u8,
-                    health: s["health"].as_u64().unwrap_or(0) as u8,
-                    freqid: s["freqid"].as_i64().map(|v| v as i8),
-                })
-                .collect();
-            data.satellites_used = data.satellites.iter().filter(|s| s.used).count() as u32;
-        }
+        && !sats.is_empty()
+    {
+        data.satellites = sats
+            .iter()
+            .map(|s| SatelliteInfo {
+                prn: s["PRN"].as_u64().unwrap_or(0) as u16,
+                gnssid: s["gnssid"].as_u64().unwrap_or(0) as u8,
+                svid: s["svid"].as_u64().unwrap_or(0) as u16,
+                elevation: json_f64(s, "el"),
+                azimuth: json_f64(s, "az"),
+                snr: json_f64(s, "ss"),
+                used: s["used"].as_bool().unwrap_or(false),
+                sigid: s["sigid"].as_u64().unwrap_or(0) as u8,
+                health: s["health"].as_u64().unwrap_or(0) as u8,
+                freqid: s["freqid"].as_i64().map(|v| v as i8),
+            })
+            .collect();
+        data.satellites_used = data.satellites.iter().filter(|s| s.used).count() as u32;
+    }
 }
 
 fn extract_pps(msg: &Value, data: &mut GPSData) {
@@ -203,9 +198,10 @@ fn extract_toff(msg: &Value, data: &mut GPSData) {
 
 fn extract_devices(msg: &Value, data: &mut GPSData) {
     if let Some(devices) = msg["devices"].as_array()
-        && let Some(dev) = devices.first() {
-            extract_device_fields(dev, data);
-        }
+        && let Some(dev) = devices.first()
+    {
+        extract_device_fields(dev, data);
+    }
 }
 
 fn extract_device(msg: &Value, data: &mut GPSData) {
@@ -277,7 +273,7 @@ mod tests {
         )
         .unwrap();
 
-        extract_tpv(&msg, &mut data, 1705318200.0);
+        extract_tpv(&msg, &mut data);
 
         assert_eq!(data.mode, FixMode::Fix3D);
         assert_eq!(data.status, FixStatus::Gps);

@@ -3,8 +3,9 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::prelude::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -127,6 +128,13 @@ impl SettingsField {
     }
 }
 
+/// A side-effecting command queued by the Device tab and executed by the event loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeviceCommand {
+    Ubxtool(Vec<String>),
+    BaudRate { speed: u32, device: String },
+}
+
 // Device configuration state
 pub struct DeviceConfigState {
     pub nav_rate_idx: usize,
@@ -134,18 +142,13 @@ pub struct DeviceConfigState {
     pub serial_speed_idx: usize,
     pub pps_frequency_idx: usize,
     pub gnss_enabled: [bool; 6], // GPS, GLONASS, Galileo, BeiDou, SBAS, QZSS
-    pub raw_command: String,
     pub output_log: Vec<String>,
     pub selected_control: usize,
     pub proto_version: String,
 }
 
-pub const NAV_RATES: &[(&str, u32)] = &[
-    ("1 Hz", 1000),
-    ("2 Hz", 500),
-    ("5 Hz", 200),
-    ("10 Hz", 100),
-];
+pub const NAV_RATES: &[(&str, u32)] =
+    &[("1 Hz", 1000), ("2 Hz", 500), ("5 Hz", 200), ("10 Hz", 100)];
 
 pub const POWER_MODES: &[(&str, u8)] = &[
     ("Full Power", 0),
@@ -157,12 +160,7 @@ pub const POWER_MODES: &[(&str, u8)] = &[
 
 pub const SERIAL_SPEEDS: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200, 230400];
 
-pub const PPS_FREQUENCIES: &[(&str, u32)] = &[
-    ("1 Hz", 1),
-    ("2 Hz", 2),
-    ("5 Hz", 5),
-    ("10 Hz", 10),
-];
+pub const PPS_FREQUENCIES: &[(&str, u32)] = &[("1 Hz", 1), ("2 Hz", 2), ("5 Hz", 5), ("10 Hz", 10)];
 
 pub const GNSS_NAMES_CONFIG: &[&str] = &["GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"];
 
@@ -180,7 +178,6 @@ impl DeviceConfigState {
             serial_speed_idx: 1, // 9600
             pps_frequency_idx: 0,
             gnss_enabled: [true; 6],
-            raw_command: String::new(),
             output_log: Vec::new(),
             selected_control: 0,
             proto_version: "18".to_string(),
@@ -198,6 +195,7 @@ pub struct App {
 
     // Subsystems
     pub logger: Option<GpsLogger>,
+    pub log_dir: PathBuf,
     pub position_hold: Option<PositionHold>,
 
     // Settings
@@ -220,6 +218,7 @@ pub struct App {
 
     // Device config state
     pub device_config: DeviceConfigState,
+    pub pending_device_cmds: Vec<DeviceCommand>,
 
     // Clock sync
     pub armed_clock_set: bool,
@@ -252,6 +251,7 @@ impl App {
             should_quit: false,
             show_settings: false,
             logger: None,
+            log_dir: PathBuf::from("."),
             position_hold: None,
             host,
             port,
@@ -266,6 +266,7 @@ impl App {
             nmea_scroll_offset: 0,
             sat_scroll_offset: 0,
             device_config: DeviceConfigState::new(),
+            pending_device_cmds: Vec::new(),
             armed_clock_set: false,
             armed_toff: Arc::new(AtomicBool::new(false)),
             stale: false,
@@ -273,8 +274,8 @@ impl App {
             reconnect_requested: false,
             status_message: String::new(),
             status_message_tick: 0,
-            cmd_tx: cmd_tx,
-            cmd_rx: cmd_rx,
+            cmd_tx,
+            cmd_rx,
         }
     }
 
@@ -318,8 +319,7 @@ impl App {
                 // Preserve app-managed TOFF state across gpsd updates
                 let toff_samples = std::mem::take(&mut self.gps_data.toff_samples);
                 let toff_armed_offset = self.gps_data.toff_armed_offset;
-                let toff_armed_gps_time =
-                    std::mem::take(&mut self.gps_data.toff_armed_gps_time);
+                let toff_armed_gps_time = std::mem::take(&mut self.gps_data.toff_armed_gps_time);
                 let toff_armed_sys_time = self.gps_data.toff_armed_sys_time;
                 let prev_time = std::mem::take(&mut self.gps_data.time);
 
@@ -339,41 +339,31 @@ impl App {
                 if !new_time.is_empty()
                     && *new_time != prev_time
                     && self.gps_data.last_seen > 0.0
+                    && let Ok(gps_time) = chrono::DateTime::parse_from_rfc3339(new_time)
                 {
-                    if let Ok(gps_time) =
-                        chrono::DateTime::parse_from_rfc3339(new_time)
+                    let gps_epoch = gps_time.timestamp() as f64
+                        + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
+                    let offset = gps_epoch - self.gps_data.last_seen;
+
+                    // Accumulate in circular buffer (max 20)
+                    if self.gps_data.toff_samples.len() >= 20 {
+                        self.gps_data.toff_samples.remove(0);
+                    }
+                    self.gps_data.toff_samples.push(offset);
+
+                    // Check for armed single-shot TOFF capture
+                    if self
+                        .armed_toff
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
                     {
-                        let gps_epoch = gps_time.timestamp() as f64
-                            + gps_time.timestamp_subsec_nanos() as f64 / 1e9;
-                        let offset = gps_epoch - self.gps_data.last_seen;
-
-                        // Accumulate in circular buffer (max 20)
-                        if self.gps_data.toff_samples.len() >= 20 {
-                            self.gps_data.toff_samples.remove(0);
-                        }
-                        self.gps_data.toff_samples.push(offset);
-
-                        // Check for armed single-shot TOFF capture
-                        if self
-                            .armed_toff
-                            .compare_exchange(
-                                true,
-                                false,
-                                Ordering::SeqCst,
-                                Ordering::Relaxed,
-                            )
-                            .is_ok()
-                        {
-                            self.gps_data.toff_armed_offset = offset;
-                            self.gps_data.toff_armed_gps_time =
-                                self.gps_data.time.clone();
-                            self.gps_data.toff_armed_sys_time =
-                                self.gps_data.last_seen;
-                            self.set_status(format!(
-                                "TOFF captured: {}",
-                                crate::formatting::fmt_offset(offset)
-                            ));
-                        }
+                        self.gps_data.toff_armed_offset = offset;
+                        self.gps_data.toff_armed_gps_time = self.gps_data.time.clone();
+                        self.gps_data.toff_armed_sys_time = self.gps_data.last_seen;
+                        self.set_status(format!(
+                            "TOFF captured: {}",
+                            crate::formatting::fmt_offset(offset)
+                        ));
                     }
                 }
 
@@ -484,7 +474,7 @@ impl App {
                 self.logger = None;
             }
         } else {
-            let mut logger = GpsLogger::new(LogFormat::Gpx);
+            let mut logger = GpsLogger::new(LogFormat::Gpx, &self.log_dir);
             if logger.start().is_ok() {
                 self.logger = Some(logger);
             }
@@ -553,24 +543,22 @@ impl App {
                 KeyCode::Down | KeyCode::Tab => {
                     self.settings_field = self.settings_field.next();
                 }
-                KeyCode::Enter => {
-                    match self.settings_field {
-                        SettingsField::Host => {
-                            self.settings_editing = true;
-                            self.settings_edit_buf = self.host.clone();
-                        }
-                        SettingsField::Port => {
-                            self.settings_editing = true;
-                            self.settings_edit_buf = self.port.to_string();
-                        }
-                        SettingsField::Units => {
-                            self.units = self.units.next();
-                        }
-                        SettingsField::CoordFormat => {
-                            self.coord_format = self.coord_format.next();
-                        }
+                KeyCode::Enter => match self.settings_field {
+                    SettingsField::Host => {
+                        self.settings_editing = true;
+                        self.settings_edit_buf = self.host.clone();
                     }
-                }
+                    SettingsField::Port => {
+                        self.settings_editing = true;
+                        self.settings_edit_buf = self.port.to_string();
+                    }
+                    SettingsField::Units => {
+                        self.units = self.units.next();
+                    }
+                    SettingsField::CoordFormat => {
+                        self.coord_format = self.coord_format.next();
+                    }
+                },
                 KeyCode::Left | KeyCode::Right => {
                     // Cycle values for Units/CoordFormat
                     match self.settings_field {
@@ -713,9 +701,8 @@ impl App {
             }
             1 => {
                 // Power mode
-                dc.power_mode_idx = (dc.power_mode_idx as i32 + dir)
-                    .rem_euclid(POWER_MODES.len() as i32)
-                    as usize;
+                dc.power_mode_idx =
+                    (dc.power_mode_idx as i32 + dir).rem_euclid(POWER_MODES.len() as i32) as usize;
             }
             2 => {
                 // Serial speed
@@ -740,33 +727,36 @@ impl App {
 
     fn device_config_activate(&mut self) {
         let dc = &mut self.device_config;
-        let proto = dc.proto_version.clone();
         match dc.selected_control {
             0 => {
                 // Nav rate
                 let (name, ms) = NAV_RATES[dc.nav_rate_idx];
-                dc.output_log.push(format!("Setting nav rate: {} ({}ms)...", name, ms));
-                self.run_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)], &proto);
+                dc.output_log
+                    .push(format!("Setting nav rate: {} ({}ms)...", name, ms));
+                self.queue_ubxtool(&["-p", &format!("CFG-RATE,{}", ms)]);
             }
             1 => {
                 // Power mode
                 let (name, mode) = POWER_MODES[dc.power_mode_idx];
-                dc.output_log.push(format!("Setting power mode: {}...", name));
-                self.run_ubxtool(&["-p", &format!("PMS,{}", mode)], &proto);
+                dc.output_log
+                    .push(format!("Setting power mode: {}...", name));
+                self.queue_ubxtool(&["-p", &format!("PMS,{}", mode)]);
             }
             2 => {
                 // Serial speed (two-step: ubxtool then gpsctl)
                 let speed = SERIAL_SPEEDS[dc.serial_speed_idx];
                 let device = self.gps_data.device.path.clone();
-                dc.output_log.push(format!("Setting baud rate to {}...", speed));
-                self.run_baud_rate_change(speed, &device, &proto);
+                dc.output_log
+                    .push(format!("Setting baud rate to {}...", speed));
+                self.pending_device_cmds
+                    .push(DeviceCommand::BaudRate { speed, device });
             }
             3 => {
                 // PPS frequency
                 let (name, freq) = PPS_FREQUENCIES[dc.pps_frequency_idx];
                 dc.output_log.push(format!("Setting PPS: {}...", name));
                 let cmd = build_tp5_cmd(freq, 100000, true);
-                self.run_ubxtool(&["-c", &cmd], &proto);
+                self.queue_ubxtool(&["-c", &cmd]);
             }
             4..=9 => {
                 // GNSS toggles
@@ -777,23 +767,42 @@ impl App {
                 let flag = if enabled { "-e" } else { "-d" };
                 let state = if enabled { "Enabling" } else { "Disabling" };
                 dc.output_log.push(format!("{} {}...", state, name));
-                self.run_ubxtool(&[flag, ubx_name], &proto);
+                self.queue_ubxtool(&[flag, ubx_name]);
             }
             10 => {
                 // Save config
                 dc.output_log.push("Saving config to flash...".to_string());
-                self.run_ubxtool(&["-p", "SAVE"], &proto);
+                self.queue_ubxtool(&["-p", "SAVE"]);
             }
             _ => {}
         }
     }
 
-    fn run_ubxtool(&self, args: &[&str], proto_ver: &str) {
+    fn queue_ubxtool(&mut self, args: &[&str]) {
+        self.pending_device_cmds.push(DeviceCommand::Ubxtool(
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
+    }
+
+    /// Execute queued device commands. Kept separate from key handling so
+    /// tests can inspect the queue without spawning real processes.
+    fn dispatch_device_commands(&mut self) {
+        let proto = self.device_config.proto_version.clone();
+        for cmd in std::mem::take(&mut self.pending_device_cmds) {
+            match cmd {
+                DeviceCommand::Ubxtool(args) => self.run_ubxtool(&args, &proto),
+                DeviceCommand::BaudRate { speed, device } => {
+                    self.run_baud_rate_change(speed, &device, &proto)
+                }
+            }
+        }
+    }
+
+    fn run_ubxtool(&self, args: &[String], proto_ver: &str) {
         let tx = self.cmd_tx.clone();
-        let full_args: Vec<String> = ["-P", proto_ver]
-            .iter()
-            .chain(args.iter())
-            .map(|s| s.to_string())
+        let full_args: Vec<String> = ["-P".to_string(), proto_ver.to_string()]
+            .into_iter()
+            .chain(args.iter().cloned())
             .collect();
         let cmd_str = format!("$ ubxtool {}", full_args.join(" "));
         let _ = tx.try_send(cmd_str);
@@ -809,10 +818,8 @@ impl App {
 
             match result {
                 Ok(Ok(output)) => {
-                    let mut result =
-                        String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let stderr =
-                        String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let mut result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                     if !stderr.is_empty() {
                         if !result.is_empty() {
                             result.push('\n');
@@ -859,8 +866,11 @@ impl App {
                 Ok(Ok(output)) => {
                     let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let combined =
-                        if err.is_empty() { out } else { format!("{}\n{}", out, err) };
+                    let combined = if err.is_empty() {
+                        out
+                    } else {
+                        format!("{}\n{}", out, err)
+                    };
                     if !combined.trim().is_empty() {
                         let _ = tx.send(combined).await;
                     }
@@ -870,9 +880,7 @@ impl App {
                     return;
                 }
                 Err(_) => {
-                    let _ = tx
-                        .send("ubxtool timed out (10s)".to_string())
-                        .await;
+                    let _ = tx.send("ubxtool timed out (10s)".to_string()).await;
                     return;
                 }
             }
@@ -902,8 +910,7 @@ impl App {
                             .send(format!("Baud rate set to {} on {}", speed_str, dev_name))
                             .await;
                     } else {
-                        let err =
-                            String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
                         let _ = tx.send(format!("gpsctl error: {}", err)).await;
                     }
                 }
@@ -911,13 +918,115 @@ impl App {
                     let _ = tx.send(format!("gpsctl error: {}", e)).await;
                 }
                 Err(_) => {
-                    let _ = tx
-                        .send("gpsctl timed out (10s)".to_string())
-                        .await;
+                    let _ = tx.send("gpsctl timed out (10s)".to_string()).await;
                 }
             }
         });
     }
+}
+
+/// Build a UBX-CFG-TP5 command string for `ubxtool -c`.
+/// Format: class,id,payload_bytes (comma-separated hex).
+fn build_tp5_cmd(freq_hz: u32, pulse_us: u32, active: bool) -> String {
+    // flags: lockGnssFreq | lockedOtherSet | isFreq | isLength | alignToTow | polarity
+    let mut flags: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40; // 0x7E
+    if active {
+        flags |= 0x01;
+    }
+
+    // Pack as little-endian: BBHhhIIIIiI
+    let mut payload = Vec::with_capacity(32);
+    payload.push(0u8); // tpIdx
+    payload.push(1u8); // version
+    payload.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    payload.extend_from_slice(&0i16.to_le_bytes()); // antCableDelay
+    payload.extend_from_slice(&0i16.to_le_bytes()); // rfGroupDelay
+    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriod
+    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriodLock
+    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatio
+    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatioLock
+    payload.extend_from_slice(&0i32.to_le_bytes()); // userConfigDelay
+    payload.extend_from_slice(&flags.to_le_bytes()); // flags
+
+    let mut parts = vec!["06".to_string(), "31".to_string()];
+    for b in &payload {
+        parts.push(format!("{:02x}", b));
+    }
+    parts.join(",")
+}
+
+pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
+    let mut app = App::new(host.to_string(), port);
+
+    // Channel for gpsd events
+    let (tx, mut rx) = mpsc::channel(100);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Spawn gpsd task
+    let mut gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
+        host.to_string(),
+        port,
+        tx.clone(),
+        shutdown_rx.clone(),
+    ));
+
+    // Event stream
+    let mut event_reader = crossterm::event::EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            Some(Ok(event)) = event_reader.next() => {
+                app.handle_event(event);
+            }
+            Some(gpsd_event) = rx.recv() => {
+                app.handle_gpsd_event(gpsd_event);
+            }
+            Some(cmd_output) = app.cmd_rx.recv() => {
+                // Split multi-line output into separate log entries
+                for line in cmd_output.lines() {
+                    if !line.trim().is_empty() {
+                        app.device_config.output_log.push(line.to_string());
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                app.tick();
+            }
+        }
+
+        app.dispatch_device_commands();
+
+        // Handle reconnect
+        if app.reconnect_requested {
+            app.reconnect_requested = false;
+            // Abort old task and start new one
+            gpsd_handle.abort();
+            let _ = gpsd_handle.await;
+
+            // Reset connection state
+            app.gps_data.connected = false;
+            app.gps_data.error_message = "Reconnecting...".to_string();
+            app.stale = false;
+
+            gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
+                app.host.clone(),
+                app.port,
+                tx.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
+
+        terminal.draw(|f| ui::render(f, &app))?;
+
+        if app.should_quit {
+            let _ = shutdown_tx.send(true);
+            break;
+        }
+    }
+
+    gpsd_handle.abort();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -987,11 +1096,25 @@ mod tests {
 
     #[test]
     fn test_toggle_logging() {
+        let dir = tempfile::tempdir().unwrap();
         let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
         assert!(app.logger.is_none());
+
         app.handle_event(key_event(KeyCode::Char('l')));
-        // Logger should be Some if file creation succeeded, None if it failed
-        // (depends on filesystem, so just verify no crash)
+        let filename = app
+            .logger
+            .as_ref()
+            .expect("logging started")
+            .filename
+            .clone();
+        assert!(filename.starts_with(dir.path().to_str().unwrap()));
+        assert!(std::path::Path::new(&filename).exists());
+
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(app.logger.is_none());
+        let contents = std::fs::read_to_string(&filename).unwrap();
+        assert!(contents.trim_end().ends_with("</gpx>"));
     }
 
     #[test]
@@ -1123,10 +1246,7 @@ mod tests {
         app.handle_event(key_event(KeyCode::Char('s'))); // open
         assert!(app.show_settings);
 
-        app.handle_event(key_event_mod(
-            KeyCode::Char('s'),
-            KeyModifiers::CONTROL,
-        ));
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(!app.show_settings);
         assert!(app.reconnect_requested);
     }
@@ -1265,12 +1385,28 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_clock_sync_no_gps() {
+    fn test_timing_clock_sync_arm_toggle() {
         let mut app = new_app();
         app.active_tab = ActiveTab::Timing;
 
         app.handle_event(key_event(KeyCode::Char('k')));
-        assert!(app.status_message.contains("No GPS time"));
+        assert!(app.armed_clock_set);
+        assert!(app.status_message.contains("ARMED"));
+
+        app.handle_event(key_event(KeyCode::Char('k')));
+        assert!(!app.armed_clock_set);
+        assert!(app.status_message.contains("disarmed"));
+    }
+
+    #[test]
+    fn test_timing_clock_sync_stays_armed_without_gps_time() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Timing;
+        app.handle_event(key_event(KeyCode::Char('k')));
+
+        // An update without GPS time must not fire the (real) clock sync
+        app.handle_gpsd_event(GpsdEvent::Update(Box::default()));
+        assert!(app.armed_clock_set);
     }
 
     #[test]
@@ -1368,6 +1504,31 @@ mod tests {
         app.handle_event(key_event(KeyCode::Enter));
         assert_eq!(app.device_config.output_log.len(), 1);
         assert!(app.device_config.output_log[0].contains("nav rate"));
+        // Queued, not executed: tests must never run ubxtool against real hardware
+        assert_eq!(
+            app.pending_device_cmds,
+            vec![DeviceCommand::Ubxtool(vec![
+                "-p".to_string(),
+                "CFG-RATE,1000".to_string()
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_device_activate_baud_rate() {
+        let mut app = new_app();
+        app.active_tab = ActiveTab::Device;
+        app.device_config.selected_control = 2;
+        app.gps_data.device.path = "/dev/ttyACM0".to_string();
+
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(
+            app.pending_device_cmds,
+            vec![DeviceCommand::BaudRate {
+                speed: SERIAL_SPEEDS[app.device_config.serial_speed_idx],
+                device: "/dev/ttyACM0".to_string(),
+            }]
+        );
     }
 
     // === Tab-specific keys don't fire on wrong tab ===
@@ -1423,7 +1584,7 @@ mod tests {
         app.stale = true;
         app.stale_seconds = 15.0;
 
-        app.handle_gpsd_event(GpsdEvent::Update(Box::new(GPSData::default())));
+        app.handle_gpsd_event(GpsdEvent::Update(Box::default()));
         assert!(!app.stale);
         assert_eq!(app.stale_seconds, 0.0);
     }
@@ -1437,10 +1598,12 @@ mod tests {
             .as_secs_f64();
 
         // Send update with GPS time
-        let mut data = GPSData::default();
-        data.time = "2024-01-15T12:30:00.000Z".to_string();
-        data.last_seen = now;
-        data.connected = true;
+        let data = GPSData {
+            time: "2024-01-15T12:30:00.000Z".to_string(),
+            last_seen: now,
+            connected: true,
+            ..Default::default()
+        };
         app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
 
         assert_eq!(app.gps_data.toff_samples.len(), 1);
@@ -1456,10 +1619,12 @@ mod tests {
 
         // Send 25 updates to overflow the 20-element buffer
         for i in 0..25 {
-            let mut data = GPSData::default();
-            data.time = format!("2024-01-15T12:30:{:02}.000Z", i % 60);
-            data.last_seen = now + i as f64;
-            data.connected = true;
+            let data = GPSData {
+                time: format!("2024-01-15T12:30:{:02}.000Z", i % 60),
+                last_seen: now + i as f64,
+                connected: true,
+                ..Default::default()
+            };
             app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
         }
 
@@ -1480,10 +1645,12 @@ mod tests {
         assert!(app.armed_toff.load(Ordering::SeqCst));
 
         // Send a GPS update with time
-        let mut data = GPSData::default();
-        data.time = "2024-01-15T12:30:00.000Z".to_string();
-        data.last_seen = now;
-        data.connected = true;
+        let data = GPSData {
+            time: "2024-01-15T12:30:00.000Z".to_string(),
+            last_seen: now,
+            connected: true,
+            ..Default::default()
+        };
         app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
 
         // Armed TOFF should have fired
@@ -1503,10 +1670,12 @@ mod tests {
             .as_secs_f64();
 
         // Accumulate some TOFF data
-        let mut data = GPSData::default();
-        data.time = "2024-01-15T12:30:00.000Z".to_string();
-        data.last_seen = now;
-        data.connected = true;
+        let data = GPSData {
+            time: "2024-01-15T12:30:00.000Z".to_string(),
+            last_seen: now,
+            connected: true,
+            ..Default::default()
+        };
         app.handle_gpsd_event(GpsdEvent::Update(Box::new(data)));
         assert!(!app.gps_data.toff_samples.is_empty());
 
@@ -1515,9 +1684,11 @@ mod tests {
         assert!(app.gps_data.toff_samples.is_empty());
 
         // Send another update WITHOUT time — toff_samples should stay empty
-        let mut data2 = GPSData::default();
-        data2.connected = true;
-        data2.last_seen = now + 1.0;
+        let data2 = GPSData {
+            connected: true,
+            last_seen: now + 1.0,
+            ..Default::default()
+        };
         app.handle_gpsd_event(GpsdEvent::Update(Box::new(data2)));
         assert!(app.gps_data.toff_samples.is_empty()); // preserved!
     }
@@ -1531,106 +1702,4 @@ mod tests {
         assert!(!app.gps_data.connected);
         assert_eq!(app.gps_data.error_message, "connection refused");
     }
-}
-
-/// Build a UBX-CFG-TP5 command string for `ubxtool -c`.
-/// Format: class,id,payload_bytes (comma-separated hex).
-fn build_tp5_cmd(freq_hz: u32, pulse_us: u32, active: bool) -> String {
-    // flags: lockGnssFreq | lockedOtherSet | isFreq | isLength | alignToTow | polarity
-    let mut flags: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40; // 0x7E
-    if active {
-        flags |= 0x01;
-    }
-
-    // Pack as little-endian: BBHhhIIIIiI
-    let mut payload = Vec::with_capacity(32);
-    payload.push(0u8); // tpIdx
-    payload.push(1u8); // version
-    payload.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    payload.extend_from_slice(&0i16.to_le_bytes()); // antCableDelay
-    payload.extend_from_slice(&0i16.to_le_bytes()); // rfGroupDelay
-    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriod
-    payload.extend_from_slice(&freq_hz.to_le_bytes()); // freqPeriodLock
-    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatio
-    payload.extend_from_slice(&pulse_us.to_le_bytes()); // pulseLenRatioLock
-    payload.extend_from_slice(&0i32.to_le_bytes()); // userConfigDelay
-    payload.extend_from_slice(&flags.to_le_bytes()); // flags
-
-    let mut parts = vec!["06".to_string(), "31".to_string()];
-    for b in &payload {
-        parts.push(format!("{:02x}", b));
-    }
-    parts.join(",")
-}
-
-pub async fn run(terminal: &mut Terminal<impl Backend>, host: &str, port: u16) -> Result<()> {
-    let mut app = App::new(host.to_string(), port);
-
-    // Channel for gpsd events
-    let (tx, mut rx) = mpsc::channel(100);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // Spawn gpsd task
-    let mut gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
-        host.to_string(),
-        port,
-        tx.clone(),
-        shutdown_rx.clone(),
-    ));
-
-    // Event stream
-    let mut event_reader = crossterm::event::EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        tokio::select! {
-            Some(Ok(event)) = event_reader.next() => {
-                app.handle_event(event);
-            }
-            Some(gpsd_event) = rx.recv() => {
-                app.handle_gpsd_event(gpsd_event);
-            }
-            Some(cmd_output) = app.cmd_rx.recv() => {
-                // Split multi-line output into separate log entries
-                for line in cmd_output.lines() {
-                    if !line.trim().is_empty() {
-                        app.device_config.output_log.push(line.to_string());
-                    }
-                }
-            }
-            _ = tick.tick() => {
-                app.tick();
-            }
-        }
-
-        // Handle reconnect
-        if app.reconnect_requested {
-            app.reconnect_requested = false;
-            // Abort old task and start new one
-            gpsd_handle.abort();
-            let _ = gpsd_handle.await;
-
-            // Reset connection state
-            app.gps_data.connected = false;
-            app.gps_data.error_message = "Reconnecting...".to_string();
-            app.stale = false;
-
-            gpsd_handle = tokio::spawn(gpsd_client::gpsd_task(
-                app.host.clone(),
-                app.port,
-                tx.clone(),
-                shutdown_rx.clone(),
-            ));
-        }
-
-        terminal.draw(|f| ui::render(f, &app))?;
-
-        if app.should_quit {
-            let _ = shutdown_tx.send(true);
-            break;
-        }
-    }
-
-    gpsd_handle.abort();
-    Ok(())
 }

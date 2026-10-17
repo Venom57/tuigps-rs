@@ -11,10 +11,7 @@ pub fn set_clock_from_gps(gps_time_str: &str, last_seen: f64) -> Result<String> 
 
     // Parse GPS time (UTC) and compensate for age
     let gps_time = DateTime::parse_from_rfc3339(gps_time_str)?;
-    let fix_age = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs_f64()
-        - last_seen;
+    let fix_age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64() - last_seen;
     let adjusted = gps_time + chrono::Duration::milliseconds((fix_age * 1000.0) as i64);
 
     // Convert to local time for timedatectl (which expects local time)
@@ -52,14 +49,15 @@ pub fn set_clock_from_gps(gps_time_str: &str, last_seen: f64) -> Result<String> 
         ))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!("All clock sync methods failed: {}", stderr.trim()))
+        Err(anyhow::anyhow!(
+            "All clock sync methods failed: {}",
+            stderr.trim()
+        ))
     }
 }
 
 #[cfg(feature = "dbus")]
-fn try_dbus_set_time(
-    _adjusted: DateTime<chrono::FixedOffset>,
-) -> Result<()> {
+fn try_dbus_set_time(_adjusted: DateTime<chrono::FixedOffset>) -> Result<()> {
     // TODO: Implement D-Bus clock setting via zbus
     Err(anyhow::anyhow!("D-Bus clock sync not yet implemented"))
 }

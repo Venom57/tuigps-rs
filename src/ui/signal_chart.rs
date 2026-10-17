@@ -10,12 +10,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let data = &app.gps_data;
-    let mut sats: Vec<_> = data.satellites.iter().filter(|s| s.snr.is_finite()).collect();
+    let mut sats: Vec<_> = data
+        .satellites
+        .iter()
+        .filter(|s| s.snr.is_finite())
+        .collect();
 
     sats.sort_by(|a, b| {
-        b.used
-            .cmp(&a.used)
-            .then(b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal))
+        b.used.cmp(&a.used).then(
+            b.snr
+                .partial_cmp(&a.snr)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     let max_snr = 55.0;
@@ -34,7 +40,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(label, Style::default().fg(color)),
             Span::raw(" "),
             Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
-            Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "\u{2591}".repeat(empty),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
 
         f.render_widget(

@@ -47,10 +47,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![
             Span::raw(format!("{}: ", label)),
             Span::styled(fmt(value, 1, ""), Style::default().fg(color)),
-            Span::styled(
-                format!(" ({})", rating),
-                Style::default().fg(color).dim(),
-            ),
+            Span::styled(format!(" ({})", rating), Style::default().fg(color).dim()),
         ]));
     }
 

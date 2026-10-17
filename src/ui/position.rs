@@ -34,23 +34,24 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     ];
 
     if let Some(hold) = &app.position_hold
-        && let Some(result) = hold.result() {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::raw("CEP50: "),
-                Span::styled(
-                    format!("{:.2} m", result.cep50),
-                    Style::default().fg(cep_color(result.cep50)),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("CEP95: "),
-                Span::styled(
-                    format!("{:.2} m", result.cep95),
-                    Style::default().fg(cep_color(result.cep95)),
-                ),
-            ]));
-        }
+        && let Some(result) = hold.result()
+    {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::raw("CEP50: "),
+            Span::styled(
+                format!("{:.2} m", result.cep50),
+                Style::default().fg(cep_color(result.cep50)),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("CEP95: "),
+            Span::styled(
+                format!("{:.2} m", result.cep95),
+                Style::default().fg(cep_color(result.cep95)),
+            ),
+        ]));
+    }
 
     f.render_widget(Paragraph::new(lines), inner);
 }

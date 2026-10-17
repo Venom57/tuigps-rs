@@ -75,10 +75,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         } else if data.toff_armed_offset.is_finite() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
-                Span::styled(
-                    "Armed TOFF: ",
-                    Style::default().fg(Color::Green).bold(),
-                ),
+                Span::styled("Armed TOFF: ", Style::default().fg(Color::Green).bold()),
                 Span::styled(
                     fmt_offset(data.toff_armed_offset),
                     Style::default().fg(Color::Green).bold(),
@@ -87,10 +84,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
             if !data.toff_armed_gps_time.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw("  GPS time: "),
-                    Span::styled(
-                        &data.toff_armed_gps_time,
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled(&data.toff_armed_gps_time, Style::default().fg(Color::White)),
                 ]));
             }
         }

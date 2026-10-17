@@ -30,11 +30,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     match app.active_tab {
         ActiveTab::Nmea => {
             spans.push(Span::raw("| "));
-            for (key, action) in &[
-                ("p", "pause"),
-                ("f", "filter"),
-                ("c", "clear"),
-            ] {
+            for (key, action) in &[("p", "pause"), ("f", "filter"), ("c", "clear")] {
                 spans.push(Span::styled(
                     format!(" {} ", key),
                     Style::default().fg(Color::Yellow).bg(Color::DarkGray),
@@ -44,11 +40,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         }
         ActiveTab::Timing => {
             spans.push(Span::raw("| "));
-            for (key, action) in &[
-                ("a", "arm"),
-                ("c", "clear"),
-                ("k", "clock"),
-            ] {
+            for (key, action) in &[("a", "arm"), ("c", "clear"), ("k", "clock")] {
                 spans.push(Span::styled(
                     format!(" {} ", key),
                     Style::default().fg(Color::Yellow).bg(Color::DarkGray),
