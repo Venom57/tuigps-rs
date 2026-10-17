@@ -8,7 +8,6 @@ use crate::data_model::GPSData;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LogFormat {
     Gpx,
-    #[allow(dead_code)] // not yet selectable from the UI
     Csv,
 }
 

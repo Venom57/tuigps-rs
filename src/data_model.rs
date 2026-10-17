@@ -63,7 +63,6 @@ pub struct SatelliteInfo {
     pub used: bool,
     pub sigid: u8,
     pub health: u8,
-    #[allow(dead_code)] // parsed from SKY but not yet displayed
     pub freqid: Option<i8>,
 }
 

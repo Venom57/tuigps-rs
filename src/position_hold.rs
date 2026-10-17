@@ -11,7 +11,6 @@ pub struct PositionHold {
     start_time: Instant,
 }
 
-#[allow(dead_code)] // only cep50 is displayed so far
 pub struct HoldResult {
     pub mean_lat: f64,
     pub mean_lon: f64,
@@ -23,6 +22,12 @@ pub struct HoldResult {
     pub cep95: f64,
     pub count: u64,
     pub duration: Duration,
+}
+
+impl Default for PositionHold {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PositionHold {

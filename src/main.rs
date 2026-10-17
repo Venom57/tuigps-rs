@@ -9,15 +9,7 @@ use ratatui::prelude::*;
 use std::io;
 use std::panic;
 
-mod app;
-mod clock_sync;
-mod constants;
-mod data_model;
-mod formatting;
-mod gps_logger;
-mod gpsd_client;
-mod position_hold;
-mod ui;
+use tuigps_rs::app;
 
 #[derive(Parser)]
 #[command(name = "tuigps-rs", about = "Terminal GPS monitor")]

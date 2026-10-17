@@ -170,6 +170,12 @@ const GNSS_UBXTOOL_NAMES: &[&str] = &["GPS", "GLONASS", "GALILEO", "BEIDOU", "SB
 // Total number of device config controls
 pub const DEVICE_CONTROL_COUNT: usize = 11; // nav_rate, power, serial, pps, 6 GNSS toggles, save
 
+impl Default for DeviceConfigState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceConfigState {
     pub fn new() -> Self {
         Self {
