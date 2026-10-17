@@ -2,6 +2,7 @@
 //! (`ubxtool` / `gpsctl`).
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::process::Output;
 use std::time::Duration;
 
 use super::App;
@@ -362,41 +363,22 @@ impl App {
         let _ = tx.try_send(cmd_str);
 
         tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::process::Command::new("ubxtool")
-                    .args(&full_args)
-                    .output(),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(output)) => {
-                    let mut result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    if !stderr.is_empty() {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str(&stderr);
-                    }
-                    if result.is_empty() {
-                        result = "(no output)".to_string();
-                    }
-                    let _ = tx.send(result).await;
-                }
-                Ok(Err(e)) => {
-                    let msg = if e.kind() == std::io::ErrorKind::NotFound {
-                        "Error: ubxtool not found (install gpsd-clients)".to_string()
+            let msg = match run_command("ubxtool", &full_args).await {
+                Ok(output) => {
+                    let text = combined_output(&output);
+                    if text.is_empty() {
+                        "(no output)".to_string()
                     } else {
-                        format!("Error: {}", e)
-                    };
-                    let _ = tx.send(msg).await;
+                        text
+                    }
                 }
-                Err(_) => {
-                    let _ = tx.send("Error: command timed out (10s)".to_string()).await;
+                Err(CmdError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    "Error: ubxtool not found (install gpsd-clients)".to_string()
                 }
-            }
+                Err(CmdError::Spawn(e)) => format!("Error: {}", e),
+                Err(CmdError::Timeout) => "Error: command timed out (10s)".to_string(),
+            };
+            let _ = tx.send(msg).await;
         });
     }
 
@@ -408,32 +390,19 @@ impl App {
 
         tokio::spawn(async move {
             // Step 1: Tell receiver to switch baud rate
-            let step1 = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::process::Command::new("ubxtool")
-                    .args(["-P", &proto, "-S", &speed_str])
-                    .output(),
-            )
-            .await;
-
-            match step1 {
-                Ok(Ok(output)) => {
-                    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    let combined = if err.is_empty() {
-                        out
-                    } else {
-                        format!("{}\n{}", out, err)
-                    };
-                    if !combined.trim().is_empty() {
-                        let _ = tx.send(combined).await;
+            let ubx_args = ["-P".to_string(), proto, "-S".to_string(), speed_str.clone()];
+            match run_command("ubxtool", &ubx_args).await {
+                Ok(output) => {
+                    let text = combined_output(&output);
+                    if !text.is_empty() {
+                        let _ = tx.send(text).await;
                     }
                 }
-                Ok(Err(e)) => {
+                Err(CmdError::Spawn(e)) => {
                     let _ = tx.send(format!("ubxtool error: {}", e)).await;
                     return;
                 }
-                Err(_) => {
+                Err(CmdError::Timeout) => {
                     let _ = tx.send("ubxtool timed out (10s)".to_string()).await;
                     return;
                 }
@@ -444,39 +413,62 @@ impl App {
             if !device.is_empty() {
                 gpsctl_args.push(device.clone());
             }
-            let step2 = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::process::Command::new("gpsctl")
-                    .args(&gpsctl_args)
-                    .output(),
-            )
-            .await;
-
-            match step2 {
-                Ok(Ok(output)) => {
-                    if output.status.success() {
-                        let dev_name = if device.is_empty() {
-                            "default device".to_string()
-                        } else {
-                            device
-                        };
-                        let _ = tx
-                            .send(format!("Baud rate set to {} on {}", speed_str, dev_name))
-                            .await;
+            let msg = match run_command("gpsctl", &gpsctl_args).await {
+                Ok(output) if output.status.success() => {
+                    let dev_name = if device.is_empty() {
+                        "default device"
                     } else {
-                        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        let _ = tx.send(format!("gpsctl error: {}", err)).await;
-                    }
+                        &device
+                    };
+                    format!("Baud rate set to {} on {}", speed_str, dev_name)
                 }
-                Ok(Err(e)) => {
-                    let _ = tx.send(format!("gpsctl error: {}", e)).await;
-                }
-                Err(_) => {
-                    let _ = tx.send("gpsctl timed out (10s)".to_string()).await;
-                }
-            }
+                Ok(output) => format!(
+                    "gpsctl error: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(CmdError::Spawn(e)) => format!("gpsctl error: {}", e),
+                Err(CmdError::Timeout) => "gpsctl timed out (10s)".to_string(),
+            };
+            let _ = tx.send(msg).await;
         });
     }
+}
+
+/// Time limit for each external device command.
+const DEVICE_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why an external device command produced no output.
+enum CmdError {
+    /// The process could not be started (e.g. not installed).
+    Spawn(std::io::Error),
+    /// The process did not finish within [`DEVICE_CMD_TIMEOUT`].
+    Timeout,
+}
+
+/// Run `program` to completion, capturing its output, within
+/// [`DEVICE_CMD_TIMEOUT`].
+async fn run_command(program: &str, args: &[String]) -> Result<Output, CmdError> {
+    match tokio::time::timeout(
+        DEVICE_CMD_TIMEOUT,
+        tokio::process::Command::new(program).args(args).output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(CmdError::Spawn(e)),
+        Err(_) => Err(CmdError::Timeout),
+    }
+}
+
+/// Trimmed stdout and stderr, joined by a newline when both are non-empty.
+fn combined_output(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Build a UBX-CFG-TP5 command string for `ubxtool -c`.
@@ -744,5 +736,20 @@ mod tests {
             dc.output_log.last().unwrap(),
             &format!("line {}", OUTPUT_LOG_MAX + 49)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_combined_output_joins_trimmed_streams() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |stdout: &str, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(combined_output(&output(" out \n", "\nerr\n")), "out\nerr");
+        assert_eq!(combined_output(&output("out\n", "  ")), "out");
+        assert_eq!(combined_output(&output("", "err")), "err");
+        assert_eq!(combined_output(&output("\n", "")), "");
     }
 }
