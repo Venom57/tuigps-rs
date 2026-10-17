@@ -1,0 +1,5 @@
+{"class":"GST","device":"/dev/ttyACM0","time":"2024-05-12T14:05:01.000Z","rms":2.440,"major":1.890,"minor":1.023,"orient":58.6,"lat":1.611,"lon":1.432,"alt":3.110}
+{"class":"ATT","device":"/dev/ttyUSB1","time":"2024-05-12T14:05:01.000Z","heading":142.23,"mag_st":"N","pitch":1.69,"roll":-4.30,"yaw":-61.00,"dip":67.5,"mag_len":0.98,"mag_x":0.12,"mag_y":-0.34,"mag_z":0.91}
+{"class":"POLL","time":"2024-05-12T14:05:01.000Z","active":1,"tpv":[{"class":"TPV","device":"/dev/ttyACM0","mode":3,"lat":10.0,"lon":20.0}],"sky":[{"class":"SKY","hdop":9.9,"satellites":[]}]}
+{"class":"IMU","device":"/dev/ttyUSB1","time":"2024-05-12T14:05:01.000Z","acc_x":0.01,"acc_y":-0.02,"acc_z":9.81}
+{"class":"RAW","device":"/dev/ttyACM0","time":1715522701,"nsec":0,"rawdata":[]}

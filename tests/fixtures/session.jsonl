@@ -1,0 +1,13 @@
+{"class":"VERSION","release":"3.25","rev":"3.25","proto_major":3,"proto_minor":15}
+{"class":"DEVICES","devices":[{"class":"DEVICE","path":"/dev/ttyACM0","driver":"u-blox","subtype":"SW ROM CORE 3.01 (107888),HW 00080000","activated":"2024-05-12T14:03:27.418Z","flags":1,"native":1,"bps":9600,"parity":"N","stopbits":1,"cycle":1.00,"mincycle":0.02}]}
+{"class":"WATCH","enable":true,"json":true,"nmea":true,"raw":0,"scaled":false,"timing":true,"split24":false,"pps":true}
+$GNRMC,140501.00,A,5128.67570,N,00000.09270,W,0.023,123.46,120524,,,A*6E
+$GNGGA,140501.00,5128.67570,N,00000.09270,W,1,07,0.81,45.6,M,45.8,M,,*5A
+{"class":"TPV","device":"/dev/ttyACM0","status":1,"mode":3,"time":"2024-05-12T14:05:01.000Z","leapseconds":18,"ept":0.005,"lat":51.477928333,"lon":-0.001545000,"altHAE":91.3450,"altMSL":45.5610,"track":123.4567,"speed":0.012,"climb":-0.003,"eph":1.85,"epv":2.345}
+{"class":"SKY","device":"/dev/ttyACM0","time":"2024-05-12T14:05:01.000Z","hdop":0.81,"pdop":1.30,"vdop":1.02,"nSat":3,"uSat":2,"satellites":[{"PRN":2,"el":42.0,"az":290.0,"ss":38.0,"used":true,"gnssid":0,"svid":2,"sigid":0,"health":1},{"PRN":68,"el":33.0,"az":76.0,"ss":31.0,"used":true,"gnssid":6,"svid":4,"sigid":0,"freqid":13,"health":1},{"PRN":305,"el":51.0,"az":112.0,"ss":41.0,"used":false,"gnssid":2,"svid":5,"sigid":1,"health":1}]}
+{"class":"GST","device":"/dev/ttyACM0","time":"2024-05-12T14:05:01.000Z","rms":2.440,"major":1.890,"minor":1.023,"orient":58.6,"lat":1.611,"lon":1.432,"alt":3.110}
+{"class":"PPS","device":"/dev/pps0","real_sec":1715522702,"real_nsec":0,"clock_sec":1715522701,"clock_nsec":999987654,"precision":-20,"shm":"NTP2","qErr":-12345}
+{"class":"TOFF","device":"/dev/ttyACM0","real_sec":1715522702,"real_nsec":0,"clock_sec":1715522702,"clock_nsec":123456789,"precision":-1,"shm":"NTP0"}
+
+$GNRMC,140502.00,A,5128.67571,N,00000.09271,W,0.019,123.46,120524,,,A*6F
+{"class":"TPV","device":"/dev/ttyACM0","status":1,"mode":3,"time":"2024-05-12T14:05:02.000Z","leapseconds":18,"ept":0.005,"lat":51.477928500,"lon":-0.001545167,"altHAE":91.3500,"altMSL":45.5660,"track":123.4567,"speed":0.010,"climb":0.001,"eph":1.84,"epv":2.340}

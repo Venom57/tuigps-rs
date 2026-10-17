@@ -1,0 +1,3 @@
+{"class":"PPS","device":"/dev/pps0","real_sec":1715522702,"real_nsec":0,"clock_sec":1715522701,"clock_nsec":999987654,"precision":-20,"shm":"NTP2","qErr":-12345}
+{"class":"TOFF","device":"/dev/ttyACM0","real_sec":1715522702,"real_nsec":0,"clock_sec":1715522702,"clock_nsec":123456789,"precision":-1,"shm":"NTP0"}
+{"class":"ERROR","message":"Unrecognized request '?FOO'"}

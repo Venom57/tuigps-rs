@@ -1,0 +1,5 @@
+{"class":"TPV","device":"/dev/ttyACM0","status":2,"mode":3,"time":"2024-05-12T14:05:01.000Z","leapseconds":18,"ept":0.005,"lat":51.477928333,"lon":-0.001545000,"altHAE":91.3450,"altMSL":45.5610,"alt":45.5610,"epx":1.042,"epy":1.329,"epv":2.345,"track":123.4567,"magtrack":124.0122,"magvar":0.6,"speed":0.012,"climb":-0.003,"epd":12.3456,"eps":0.25,"epc":4.69,"geoidSep":45.784,"eph":1.85,"sep":3.1,"ecefx":3980581.91,"ecefy":-111.27,"ecefz":4966824.52,"ecefvx":0.01,"ecefvy":-0.02,"ecefvz":0.00,"ecefpAcc":2.34,"ecefvAcc":0.25,"velN":-0.007,"velE":0.010,"velD":0.003}
+{"class":"TPV","device":"/dev/ttyACM0","mode":2,"time":"2024-05-12T14:05:02.000Z","leapseconds":18,"ept":0.005,"lat":-33.856784,"lon":151.215297,"epx":15.319,"epy":17.054,"track":10.3797,"speed":0.091,"eps":34.11,"eph":22.9}
+{"class":"TPV","device":"/dev/ttyACM0","mode":1,"time":"2024-05-12T14:05:03.000Z","leapseconds":18,"ept":0.005}
+{"class":"TPV","device":"/dev/ttyACM0","mode":0}
+{"class":"TPV","device":"/dev/ttyACM0","status":3,"mode":3,"time":"2024-05-12T14:05:04.250Z","lat":40.689247,"lon":-74.044502,"altHAE":-12.5,"altMSL":20.25}
