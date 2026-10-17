@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use crate::app::{App, CoordFormat, SettingsField, UnitSystem};
+use crate::app::{App, CoordFormat, SETTINGS_BINDINGS, SettingsField, UnitSystem};
 
 pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, area);
@@ -71,19 +71,78 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             coord_desc,
         ),
         Line::raw(""),
+        render_save_button(sel == SettingsField::Save, app.config_path.is_some()),
+        message_line(&app.settings_message),
         Line::styled(
             "  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             Style::default().fg(Color::DarkGray),
         ),
-        help_line(&[("Up/Down", "navigate    "), ("Enter", "edit / cycle value")]),
-        help_line(&[
-            ("\u{2190}/\u{2192}    ", "cycle value "),
-            ("Esc  ", "close"),
-        ]),
-        help_line(&[("Ctrl+S ", "apply & reconnect to gpsd")]),
-    ];
+    ]
+    .into_iter()
+    .chain(help_lines())
+    .collect::<Vec<_>>();
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_save_button<'a>(selected: bool, persists: bool) -> Line<'a> {
+    let marker = if selected { "> " } else { "  " };
+    let style = if selected {
+        Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+    } else {
+        Style::default().bold()
+    };
+    let note = if persists {
+        "  apply, reconnect if needed, save to config"
+    } else {
+        "  apply (config file unavailable)"
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(Color::Yellow)),
+        Span::styled("[ Save ]", style),
+        Span::styled(note, Style::default().italic()),
+    ])
+}
+
+/// Validation error (e.g. invalid port) shown inside the dialog, since the
+/// dialog hides the status bar.
+fn message_line<'a>(message: &str) -> Line<'a> {
+    if message.is_empty() {
+        Line::raw("")
+    } else {
+        Line::styled(
+            format!("  ! {}", message),
+            Style::default().fg(Color::Red).bold(),
+        )
+    }
+}
+
+/// Key help generated from `SETTINGS_BINDINGS`, two keys per line.
+fn help_lines() -> Vec<Line<'static>> {
+    let key_w = SETTINGS_BINDINGS
+        .iter()
+        .map(|b| b.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    SETTINGS_BINDINGS
+        .chunks(2)
+        .map(|pair| {
+            let mut spans = vec![Span::raw("  ")];
+            for (i, b) in pair.iter().enumerate() {
+                spans.push(Span::styled(
+                    format!("{:<key_w$}", b.label),
+                    Style::default().fg(Color::Yellow).bold(),
+                ));
+                spans.push(Span::raw(" "));
+                if i == 0 && pair.len() > 1 {
+                    spans.push(Span::raw(format!("{:<20}", b.desc)));
+                } else {
+                    spans.push(Span::raw(b.desc));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn render_field<'a>(
@@ -140,20 +199,6 @@ fn render_cycle_field<'a>(label: &str, value: &str, selected: bool, description:
         Span::styled(arrows, Style::default().fg(Color::Yellow)),
         Span::styled(desc_text, Style::default().italic()),
     ])
-}
-
-/// A help line: keys in bold yellow, descriptions in the default color.
-fn help_line<'a>(items: &[(&'a str, &'a str)]) -> Line<'a> {
-    let mut spans = vec![Span::raw("  ")];
-    for (key, desc) in items {
-        spans.push(Span::styled(
-            *key,
-            Style::default().fg(Color::Yellow).bold(),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::raw(*desc));
-    }
-    Line::from(spans)
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

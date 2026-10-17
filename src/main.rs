@@ -8,21 +8,30 @@ use crossterm::{
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
 use std::panic;
+use std::path::PathBuf;
 
-use tuigps_rs::app;
+use tuigps_rs::{app, config};
 
 #[derive(Parser)]
 #[command(name = "tuigps-rs", about = "Terminal GPS monitor")]
 struct Cli {
-    #[arg(long, default_value = "localhost")]
-    host: String,
-    #[arg(long, default_value_t = 2947)]
-    port: u16,
+    /// gpsd host; overrides the config file [default: localhost]
+    #[arg(long)]
+    host: Option<String>,
+    /// gpsd port; overrides the config file [default: 2947]
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    port: Option<u16>,
+    /// Config file [default: $XDG_CONFIG_HOME/tuigps-rs/config.toml or
+    /// ~/.config/tuigps-rs/config.toml]
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config_path = cli.config.or_else(config::default_path);
+    let startup = config::startup(config_path, cli.host, cli.port);
 
     install_panic_hook();
 
@@ -36,7 +45,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let result = app::run(&mut terminal, &cli.host, cli.port).await;
+    let result = app::run(&mut terminal, startup).await;
 
     restore_terminal();
     result
