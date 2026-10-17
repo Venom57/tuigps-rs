@@ -21,6 +21,8 @@ jobs:
             features: ""
           - name: no default features
             features: "--no-default-features"
+          - name: all features
+            features: "--all-features"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,3 +35,24 @@ jobs:
       - run: cargo clippy --all-targets --locked ${{ matrix.features }}
       - run: cargo test --all-targets --locked ${{ matrix.features }}
       - run: cargo build --release --locked ${{ matrix.features }}
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # `+1.88` overrides rust-toolchain.toml (which pins stable).
+      - run: cargo +1.88 check --all-targets --locked
+      - run: cargo +1.88 check --all-targets --locked --all-features
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

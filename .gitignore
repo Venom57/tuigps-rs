@@ -2,9 +2,8 @@
 /target/
 **/*.rs.bk
 
-# Cargo lock (binary, not library)
-# Uncomment if you want to track it:
-# Cargo.lock
+# Cargo.lock is committed on purpose: this is a binary crate, and CI
+# builds with --locked.
 
 # IDE
 .idea/
@@ -17,9 +16,11 @@
 .DS_Store
 Thumbs.db
 
-# GPS log files
+# GPS log files (written to the working directory by the `l` key)
 *.gpx
 *.csv
+# ...but keep test fixtures
+!tests/fixtures/**
 
 # Environment
 .env
