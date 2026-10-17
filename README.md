@@ -11,10 +11,12 @@ A complete reimplementation of [tuigps](https://github.com/smartin/tuigps) (Pyth
 - **Precision timing** — PPS offset display, TOFF (time offset) measurement with statistics, armed single-shot TOFF
 - **Device configuration** — u-blox receiver management via ubxtool (nav rate, power mode, PPS, constellations, serial speed)
 - **Clock synchronization** — arm a one-shot set of the system clock from GPS time on the next fix (timedatectl, falling back to `sudo -n date`)
-- **Position hold** — accumulate fixes with Welford's algorithm, compute CEP50/CEP95 statistics
-- **GPS logging** — GPX track to a timestamped file in the working directory (a CSV writer exists in code but is not reachable from the UI)
-- **NMEA viewer** — raw sentence stream with type filtering, pause/resume, color coding
-- **Settings** — host/port, units (metric/imperial/nautical), coordinate format (DD/DMS/DDM); not persisted between runs
+- **Position hold** — accumulate fixes with Welford's algorithm; a Hold panel shows mean position, sample count, duration, σN/σE and CEP50/CEP95 (exact bivariate-normal radius)
+- **GPS logging** — GPX 1.1 track to a timestamped file in the working directory, flushed per point and finalized even on abnormal exit; existing files are never overwritten (a CSV writer exists in code but is not reachable from the UI)
+- **NMEA viewer** — raw sentence stream with type filtering, pause/resume, scroll-back that stays anchored, color coding
+- **Settings** — host/port, units (metric/imperial/nautical), coordinate format (DD/DMS/DDM), saved to a config file
+- **Status at a glance** — connection badge always visible, fix age, panels marked NO DATA / STALE when data stops, `?` help overlay
+- **Accessibility** — constellation letters on the sky plot (not color alone), default-foreground text for light themes, [`NO_COLOR`](https://no-color.org) support
 
 ## Requirements
 
@@ -42,7 +44,36 @@ cargo build --release
 
 # Connect to remote gpsd
 ./target/release/tuigps-rs --host 192.168.1.100 --port 2947
+
+# Use a specific config file
+./target/release/tuigps-rs --config ./my-config.toml
 ```
+
+### Configuration
+
+Settings are loaded from `$XDG_CONFIG_HOME/tuigps-rs/config.toml`
+(default `~/.config/tuigps-rs/config.toml`) and written when you apply
+settings (`Ctrl+S` or `[ Save ]`). A missing or invalid file falls back to
+defaults with a status message. `--host` / `--port` override the file.
+
+```toml
+host = "localhost"
+port = 2947
+units = "metric"        # metric | imperial | nautical
+coord_format = "dd"     # dd | dms | ddm
+```
+
+### Units
+
+| | metric | imperial | nautical |
+|---|---|---|---|
+| Speed, EPS | km/h | mph | kn |
+| Climb, EPC | m/s | ft/min | ft/min |
+| Altitude, geoid, EPH/EPV/EPX/EPY/SEP, CEP, σ | m | ft | ft |
+
+`u` cycles units for the current session only; use Settings to save them.
+
+Set `NO_COLOR=1` to disable colors (badges switch to reverse video).
 
 ## Testing with simulated GPS
 
@@ -52,75 +83,88 @@ gpsfake -c 0.5 /usr/share/gpsd/sample.nmea
 
 ## Keyboard Shortcuts
 
+Press `?` at any time for a help overlay generated from the same key table the
+app uses, so it always matches the current tab.
+
 ### Global
 
 | Key | Action |
 |-----|--------|
-| `q` / `Ctrl+C` | Quit |
-| `s` | Open settings |
+| `?` | Toggle help |
+| `1`–`5` | Jump to tab |
+| `Tab` / `Shift+Tab` | Next / previous tab |
+| `q` / `Ctrl+C` | Quit (`Ctrl+C` works everywhere, including text input) |
+| `Esc` | Close overlay / dismiss prompt |
 | `r` | Reconnect to gpsd |
-| `u` | Cycle units (metric/imperial/nautical) |
+| `s` | Settings |
+| `u` | Cycle units (not saved) |
 | `m` | Open position in Google Maps (requires fix) |
-| `l` | Toggle GPS logging (GPX) |
-| `h` | Toggle position hold |
-| `Tab` | Next tab |
-| `Shift+Tab` | Previous tab |
-
-Logging writes `tuigps_YYYYMMDD_HHMMSS.gpx` to the current directory.
+| `l` | Start/stop GPX logging (`tuigps_YYYYMMDD_HHMMSS.gpx` in the current directory) |
+| `h` | Start/stop position hold |
 
 ### Satellites Tab
 
 | Key | Action |
 |-----|--------|
-| `Up/Down` | Scroll satellite table |
-| `PageUp/PageDown` | Scroll satellite table (fast) |
+| `↑/↓` | Scroll one line |
+| `PgUp/PgDn` | Scroll one page |
+| `Home/End` | First / last satellite |
 
 ### Timing Tab
 
 | Key | Action |
 |-----|--------|
-| `a` | Arm single-shot TOFF capture |
-| `c` | Clear TOFF samples and armed data |
-| `k` | Arm / disarm a one-shot clock sync on the next GPS fix |
+| `a` | Arm one-shot TOFF capture |
+| `c` | Clear TOFF data |
+| `k` | Arm / disarm a one-shot clock sync on the next fix |
 
-When an armed sync fires it runs `timedatectl set-ntp false`, then tries
-`timedatectl set-time`, then `sudo -n date -u -s`. There is no PPS-edge
-sync path. The D-Bus method is a stub behind the non-default `dbus` feature.
+An armed clock sync fires only on a fresh TPV with a 2D/3D fix, compensates
+for the fix age (refusing fixes older than 60 s) and keeps sub-second
+precision. It runs off the UI thread: `timedatectl set-ntp false`, then
+`timedatectl set-time`, then `sudo -n date -u -s` (all non-interactive). If
+every method fails, NTP is re-enabled. There is no PPS-edge sync path; the
+D-Bus method is a stub behind the non-default `dbus` feature.
 
 ### Device Tab
 
 | Key | Action |
 |-----|--------|
-| `Up/Down` | Select control |
-| `Left/Right` | Adjust value / toggle |
-| `Enter` | Apply selected control |
+| `↑/↓` | Select control |
+| `←/→` | Change value (`*` = pending, `✓` = applied) |
+| `Enter` | Apply — asks for confirmation first |
+| `y` / other key | Confirm / cancel |
+
+Baud-rate changes, disabling a constellation and saving to flash show a
+warning before confirming. "Applied" means the command was sent; the
+receiver's actual configuration is not read back.
 
 ### NMEA Tab
 
 | Key | Action |
 |-----|--------|
-| `p` | Pause/resume NMEA stream |
-| `f` | Cycle sentence filter (ALL/GGA/RMC/GSA/GSV/VTG/GLL/ZDA) |
-| `c` | Clear NMEA buffer |
-| `Up/Down` | Scroll |
-| `PageUp/PageDown` | Scroll (fast) |
+| `p` | Pause / resume the stream |
+| `f` | Cycle sentence filter |
+| `c` | Clear buffer |
+| `↑/↓`, `PgUp/PgDn` | Scroll back / forward |
+| `Home/End` | Oldest / follow newest |
+
+The title shows FOLLOWING, SCROLLED +N or PAUSED.
 
 ### Settings Overlay
 
 | Key | Action |
 |-----|--------|
-| `Up/Down`, `Tab/Shift+Tab` | Move between fields |
-| `Enter` | Edit Host/Port (Enter again to accept) / cycle Units, Coords |
-| `Left` or `Right` | Cycle Units / Coords forward (both keys go forward) |
-| `Esc` | Cancel edit / close settings |
-| `Ctrl+S` | Close settings and reconnect |
+| `↑/↓`, `Tab/Shift+Tab` | Move between fields |
+| `Enter` | Edit host/port, cycle units/coords, or activate `[ Save ]` |
+| `←/→` | Cycle value backward / forward |
+| `Ctrl+S` | Apply and save (reconnects if host/port changed) |
+| `Esc` | Cancel the current edit; press again to discard changes and close |
 
-Changes take effect immediately (host/port on the next reconnect) and are
-not saved; restarting resets them to the CLI defaults.
+The port accepts digits only (1–65535).
 
 ## Tabs
 
-1. **Dashboard** — grid layout with position, fix, velocity, sky plot, signal chart, errors, device, time
+1. **Dashboard** — grid layout with position (incl. fix age), fix, velocity (or Hold stats while position hold is on), sky plot, signal chart, errors, device, time
 2. **Satellites** — constellation summary and detailed satellite table (scrollable)
 3. **Timing** — PPS/TOFF details, armed measurements, TOFF statistics, clock sync
 4. **Device** — u-blox configuration (nav rate, power, PPS, constellations, serial speed)
@@ -134,6 +178,8 @@ cargo clippy --all-targets # lint (CI runs with -D warnings)
 cargo test                 # unit + integration tests
 cargo deny check           # licenses / advisories (needs cargo-deny)
 ```
+
+Optional pre-commit hook (fmt + clippy): `git config core.hooksPath .githooks`.
 
 The crate is a library (`src/lib.rs`) plus a thin binary (`src/main.rs`) so
 integration tests under `tests/` can use the modules directly.
