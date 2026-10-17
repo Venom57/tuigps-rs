@@ -55,7 +55,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
                     Span::raw(format!("({} samples)", timing.toff_samples.len())),
                 ]));
                 lines.push(Line::from(format!("  Mean: {}", fmt_offset(mean))));
-                lines.push(Line::from(format!("  Std:  {}", fmt_offset(std))));
+                // A standard deviation is a magnitude, so drop the sign
+                lines.push(Line::from(format!(
+                    "  Std:  {}",
+                    fmt_offset(std).trim_start_matches('+')
+                )));
                 lines.push(Line::from(format!("  Min:  {}", fmt_offset(min))));
                 lines.push(Line::from(format!("  Max:  {}", fmt_offset(max))));
             }
