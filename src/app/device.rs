@@ -180,6 +180,16 @@ impl DeviceConfigState {
 }
 
 impl App {
+    /// Move the Device tab selection up or down, stopping at the ends.
+    pub(super) fn device_config_select(&mut self, up: bool) {
+        let dc = &mut self.device_config;
+        if up {
+            dc.selected_control = dc.selected_control.saturating_sub(1);
+        } else if dc.selected_control < DEVICE_CONTROL_COUNT - 1 {
+            dc.selected_control += 1;
+        }
+    }
+
     pub(super) fn device_config_adjust(&mut self, dir: i32) {
         let dc = &mut self.device_config;
         match dc.selected_control {

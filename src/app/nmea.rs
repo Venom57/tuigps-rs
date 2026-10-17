@@ -1,5 +1,7 @@
 //! NMEA tab: sentence buffer, pause buffer, type filter and scrolling.
 
+use std::collections::VecDeque;
+
 use super::App;
 use super::scroll::Scroll;
 
@@ -55,11 +57,8 @@ impl App {
     /// bottom-relative offset grows with each visible line so the view
     /// stays on the same sentences.
     pub fn push_nmea(&mut self, sentence: String) {
-        if self.nmea_buffer.len() >= NMEA_BUFFER_MAX {
-            self.nmea_buffer.pop_front();
-        }
         let visible = self.nmea_matches(&sentence);
-        self.nmea_buffer.push_back(sentence);
+        push_capped(&mut self.nmea_buffer, sentence);
         if self.nmea_scroll_offset > 0 {
             if visible {
                 self.nmea_scroll_offset += 1;
@@ -69,14 +68,27 @@ impl App {
         }
     }
 
+    /// A sentence from gpsd: shown live, or held while paused.
+    pub(super) fn receive_nmea(&mut self, sentence: String) {
+        if self.nmea_paused {
+            push_capped(&mut self.nmea_pause_buffer, sentence);
+        } else {
+            self.push_nmea(sentence);
+        }
+    }
+
+    pub(super) fn clear_nmea(&mut self) {
+        self.nmea_buffer.clear();
+        self.nmea_pause_buffer.clear();
+        self.nmea_scroll_offset = 0;
+        self.set_status("NMEA buffer cleared");
+    }
+
     pub(super) fn toggle_nmea_pause(&mut self) {
         if self.nmea_paused {
             // Unpause: merge pause buffer into main buffer
             while let Some(s) = self.nmea_pause_buffer.pop_front() {
-                if self.nmea_buffer.len() >= NMEA_BUFFER_MAX {
-                    self.nmea_buffer.pop_front();
-                }
-                self.nmea_buffer.push_back(s);
+                push_capped(&mut self.nmea_buffer, s);
             }
         }
         self.nmea_paused = !self.nmea_paused;
@@ -94,6 +106,15 @@ impl App {
         };
         self.set_status(format!("Filter: {}", label));
     }
+}
+
+/// Append to an NMEA buffer, dropping the oldest line beyond
+/// [`NMEA_BUFFER_MAX`].
+fn push_capped(buf: &mut VecDeque<String>, sentence: String) {
+    if buf.len() >= NMEA_BUFFER_MAX {
+        buf.pop_front();
+    }
+    buf.push_back(sentence);
 }
 
 #[cfg(test)]

@@ -389,23 +389,11 @@ impl App {
             }
             Action::NmeaPause => self.toggle_nmea_pause(),
             Action::NmeaFilter => self.cycle_nmea_filter(),
-            Action::NmeaClear => {
-                self.nmea_buffer.clear();
-                self.nmea_pause_buffer.clear();
-                self.nmea_scroll_offset = 0;
-                self.set_status("NMEA buffer cleared");
-            }
+            Action::NmeaClear => self.clear_nmea(),
             Action::ToffArm => self.arm_toff(),
             Action::ToffClear => self.clear_toff(),
             Action::ClockSyncToggle => self.toggle_clock_sync(),
-            Action::DeviceSelect => {
-                let dc = &mut self.device_config;
-                if code == KeyCode::Up {
-                    dc.selected_control = dc.selected_control.saturating_sub(1);
-                } else if dc.selected_control < DEVICE_CONTROL_COUNT - 1 {
-                    dc.selected_control += 1;
-                }
-            }
+            Action::DeviceSelect => self.device_config_select(code == KeyCode::Up),
             Action::DeviceAdjust => {
                 self.device_config_adjust(if code == KeyCode::Left { -1 } else { 1 })
             }

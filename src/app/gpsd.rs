@@ -2,7 +2,6 @@
 //! processing (TOFF, clock sync, logging, position hold) and staleness.
 
 use super::App;
-use super::nmea::NMEA_BUFFER_MAX;
 use crate::data_model::GPSData;
 use crate::gpsd_client::{GpsdEvent, GpsdMessage, MsgClass, TaggedEvent};
 
@@ -48,16 +47,7 @@ impl App {
                 self.gps_data.connected = false;
                 self.gps_data.error_message = msg;
             }
-            GpsdEvent::Nmea(sentence) => {
-                if self.nmea_paused {
-                    if self.nmea_pause_buffer.len() >= NMEA_BUFFER_MAX {
-                        self.nmea_pause_buffer.pop_front();
-                    }
-                    self.nmea_pause_buffer.push_back(sentence);
-                } else {
-                    self.push_nmea(sentence);
-                }
-            }
+            GpsdEvent::Nmea(sentence) => self.receive_nmea(sentence),
         }
     }
 
