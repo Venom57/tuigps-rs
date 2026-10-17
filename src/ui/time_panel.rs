@@ -1,6 +1,5 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::sync::atomic::Ordering;
 
 use crate::app::App;
 use crate::formatting::{fmt, fmt_offset, fmt_time_iso};
@@ -59,7 +58,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         }
 
         // Armed TOFF state
-        let is_armed = app.armed_toff.load(Ordering::Relaxed);
+        let is_armed = app.armed_toff;
         if is_armed {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
