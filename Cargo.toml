@@ -14,7 +14,7 @@ publish = false
 
 [dependencies]
 # TUI
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Async runtime
