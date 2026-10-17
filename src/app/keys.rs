@@ -134,7 +134,7 @@ pub const GLOBAL_BINDINGS: &[KeyBinding] = &[
     kb(
         &[KeyCode::Char('l')],
         "l",
-        "Start/stop GPX logging",
+        "Start/stop track logging",
         Some("log"),
         Action::ToggleLog,
     ),

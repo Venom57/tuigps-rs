@@ -29,7 +29,7 @@ Terminal UI GPS monitoring tool using gpsd, written in Rust.
 - `src/data_model.rs` — structs for GPS state (GPSData, SatelliteInfo, DOPValues, etc.)
 - `src/constants.rs` — GNSS names, colors, status maps, DOP ratings
 - `src/formatting.rs` — NaN-safe formatting helpers
-- `src/gps_logger.rs` — GPX/CSV file logging (only GPX is reachable from the UI)
+- `src/gps_logger.rs` — GPX/CSV file logging; `LogMode` (gpx/csv/both) selects the files, `CSV_HEADER` documents the columns (append-only)
 - `src/position_hold.rs` — Welford's algorithm for position averaging
 - `src/clock_sync.rs` — system clock sync via timedatectl, falling back to `sudo -n date` (D-Bus path is a stub behind the non-default `dbus` feature)
 - `src/ui/` — rendering functions per tab/widget

@@ -12,6 +12,8 @@ pub enum SettingsField {
     Port,
     Units,
     CoordFormat,
+    LogFormat,
+    LogDir,
     /// The "\[ Save \]" button: Enter applies like Ctrl+S.
     Save,
 }
@@ -22,6 +24,8 @@ impl SettingsField {
         SettingsField::Port,
         SettingsField::Units,
         SettingsField::CoordFormat,
+        SettingsField::LogFormat,
+        SettingsField::LogDir,
         SettingsField::Save,
     ];
 
@@ -39,6 +43,24 @@ impl SettingsField {
 
 /// Longest host name accepted by the settings dialog (DNS limit).
 const MAX_HOST_LEN: usize = 253;
+
+/// Longest log directory path accepted by the settings dialog (PATH_MAX).
+const MAX_PATH_LEN: usize = 4096;
+
+/// Validate a log directory typed into the settings dialog: it must already
+/// exist (after `~` expansion) so logging can't fail later for that reason.
+pub fn validate_log_dir(text: &str) -> Result<std::path::PathBuf, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Log directory is empty (use . for the current directory)".to_string());
+    }
+    let path = std::path::PathBuf::from(text);
+    if config::expand_tilde(&path).is_dir() {
+        Ok(path)
+    } else {
+        Err(format!("Not an existing directory: {}", text))
+    }
+}
 
 /// Validate a port typed into the settings dialog.
 pub fn validate_port(text: &str) -> Result<u16, String> {
@@ -80,6 +102,8 @@ impl App {
             self.port = old.port;
             self.units = old.units;
             self.coord_format = old.coord_format;
+            self.log_mode = old.log_format;
+            self.log_dir = old.log_dir;
             if changed {
                 self.set_status("Settings changes discarded");
             }
@@ -103,6 +127,9 @@ impl App {
             msg.push(format!("Reconnecting to {}:{}", new.host, new.port));
         } else {
             msg.push("Settings applied".to_string());
+        }
+        if self.is_logging() && (old.log_format != new.log_format || old.log_dir != new.log_dir) {
+            msg.push("log changes apply from the next logging session".to_string());
         }
         if let Some(path) = &self.config_path {
             match config::save(path, &new) {
@@ -133,6 +160,9 @@ impl App {
                 }
             }
             SettingsField::Port => validate_port(&self.settings_edit_buf).map(|p| self.port = p),
+            SettingsField::LogDir => {
+                validate_log_dir(&self.settings_edit_buf).map(|d| self.log_dir = d)
+            }
             _ => Ok(()),
         };
         match result {
@@ -175,18 +205,25 @@ impl App {
                     self.settings_editing = true;
                     self.settings_edit_buf = self.port.to_string();
                 }
+                SettingsField::LogDir => {
+                    self.settings_editing = true;
+                    self.settings_edit_buf = self.log_dir.to_string_lossy().into_owned();
+                }
                 SettingsField::Units => self.units = self.units.next(),
                 SettingsField::CoordFormat => self.coord_format = self.coord_format.next(),
+                SettingsField::LogFormat => self.log_mode = self.log_mode.next(),
                 SettingsField::Save => self.apply_settings(),
             },
             KeyCode::Left => match self.settings_field {
                 SettingsField::Units => self.units = self.units.prev(),
                 SettingsField::CoordFormat => self.coord_format = self.coord_format.prev(),
+                SettingsField::LogFormat => self.log_mode = self.log_mode.prev(),
                 _ => {}
             },
             KeyCode::Right => match self.settings_field {
                 SettingsField::Units => self.units = self.units.next(),
                 SettingsField::CoordFormat => self.coord_format = self.coord_format.next(),
+                SettingsField::LogFormat => self.log_mode = self.log_mode.next(),
                 _ => {}
             },
             _ => {}
@@ -224,6 +261,17 @@ impl App {
                         };
                     }
                 }
+                SettingsField::LogDir => {
+                    if c.is_control() {
+                        self.settings_message =
+                            "Path cannot contain control characters".to_string();
+                    } else if self.settings_edit_buf.len() >= MAX_PATH_LEN {
+                        self.settings_message = "Path too long".to_string();
+                    } else {
+                        self.settings_edit_buf.push(c);
+                        self.settings_message.clear();
+                    }
+                }
                 _ => {
                     if c.is_whitespace() || c.is_control() {
                         self.settings_message = "Host cannot contain spaces".to_string();
@@ -245,6 +293,7 @@ mod tests {
     use super::*;
     use crate::app::test_util::*;
     use crate::app::{ActiveTab, CoordFormat, UnitSystem};
+    use crate::gps_logger::LogMode;
 
     // === Settings overlay ===
 
@@ -264,6 +313,12 @@ mod tests {
         assert_eq!(app.settings_field, SettingsField::CoordFormat);
 
         app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::LogFormat);
+
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.settings_field, SettingsField::LogDir);
+
+        app.handle_event(key_event(KeyCode::Down));
         assert_eq!(app.settings_field, SettingsField::Save);
 
         app.handle_event(key_event(KeyCode::Down));
@@ -271,6 +326,64 @@ mod tests {
 
         app.handle_event(key_event(KeyCode::Up));
         assert_eq!(app.settings_field, SettingsField::Save); // wraps back
+    }
+
+    #[test]
+    fn test_settings_log_format_cycles_and_cancel_restores() {
+        let mut app = new_app();
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.settings_field = SettingsField::LogFormat;
+        assert_eq!(app.log_mode, LogMode::Gpx);
+        app.handle_event(key_event(KeyCode::Right));
+        assert_eq!(app.log_mode, LogMode::Csv);
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(app.log_mode, LogMode::Both);
+        app.handle_event(key_event(KeyCode::Left));
+        assert_eq!(app.log_mode, LogMode::Csv);
+
+        app.handle_event(key_event(KeyCode::Esc)); // discard & close
+        assert!(!app.show_settings);
+        assert_eq!(app.log_mode, LogMode::Gpx);
+    }
+
+    #[test]
+    fn test_settings_log_dir_validated_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.config_path = Some(dir.path().join("config.toml"));
+        app.handle_event(key_event(KeyCode::Char('s')));
+        app.settings_field = SettingsField::LogDir;
+
+        // Nonexistent directory: rejected, editing continues
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.settings_editing);
+        app.settings_edit_buf = dir.path().join("missing").to_string_lossy().into_owned();
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(app.settings_editing);
+        assert!(app.settings_message.contains("Not an existing directory"));
+
+        // Paths may contain spaces
+        let spaced = dir.path().join("gps logs");
+        std::fs::create_dir(&spaced).unwrap();
+        app.settings_edit_buf = dir.path().to_string_lossy().into_owned();
+        for c in "/gps logs".chars() {
+            app.handle_event(key_event(KeyCode::Char(c)));
+        }
+        app.handle_event(key_event(KeyCode::Enter));
+        assert!(!app.settings_editing, "{}", app.settings_message);
+        assert_eq!(app.log_dir, spaced);
+
+        app.handle_event(key_event_mod(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let saved = crate::config::load(app.config_path.as_ref().unwrap()).0;
+        assert_eq!(saved.log_dir, spaced);
+    }
+
+    #[test]
+    fn test_validate_log_dir() {
+        assert!(validate_log_dir("").is_err());
+        assert!(validate_log_dir("   ").is_err());
+        assert_eq!(validate_log_dir("."), Ok(std::path::PathBuf::from(".")));
+        assert!(validate_log_dir("/definitely/not/a/dir").is_err());
     }
 
     #[test]

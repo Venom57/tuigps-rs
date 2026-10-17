@@ -2,11 +2,12 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::app::{App, CoordFormat, SETTINGS_BINDINGS, SettingsField, UnitSystem};
+use crate::gps_logger::LogMode;
 
 pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, area);
 
-    let dialog_area = centered_rect(62, 20, area);
+    let dialog_area = centered_rect(62, 22, area);
     // Terminal-default background with a colored border: text styles below
     // use the default foreground (or Yellow accents) so every line is
     // readable on both dark and light themes. Only the divider is DarkGray.
@@ -30,6 +31,21 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
         CoordFormat::DMS => "51\u{00b0} 30' 26.640\" N",
         CoordFormat::DDM => "51\u{00b0} 30.444000' N",
     };
+
+    let log_desc = match app.log_mode {
+        LogMode::Gpx => "track for mapping tools",
+        LogMode::Csv => "spreadsheet, one row per fix",
+        LogMode::Both => ".gpx + .csv, same name",
+    };
+    // Long paths keep their tail (the part that identifies the directory)
+    let log_dir = tail_ellipsis(
+        &if editing && sel == SettingsField::LogDir {
+            app.settings_edit_buf.clone()
+        } else {
+            app.log_dir.to_string_lossy().into_owned()
+        },
+        MAX_DIR_CHARS,
+    );
 
     let lines = vec![
         Line::raw(""),
@@ -69,6 +85,21 @@ pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
             app.coord_format.as_str().to_uppercase().as_str(),
             sel == SettingsField::CoordFormat,
             coord_desc,
+        ),
+        Line::raw(""),
+        Line::styled("  Logging (l)", Style::default().bold().underlined()),
+        render_cycle_field(
+            "Format",
+            app.log_mode.label(),
+            sel == SettingsField::LogFormat,
+            log_desc,
+        ),
+        render_field(
+            "Dir",
+            &log_dir,
+            sel == SettingsField::LogDir,
+            editing && sel == SettingsField::LogDir,
+            "existing directory, ~ ok",
         ),
         Line::raw(""),
         render_save_button(sel == SettingsField::Save, app.config_path.is_some()),
@@ -201,8 +232,38 @@ fn render_cycle_field<'a>(label: &str, value: &str, selected: bool, description:
     ])
 }
 
+/// Characters of the log directory shown before it is cut from the left.
+const MAX_DIR_CHARS: usize = 24;
+
+/// `s` unchanged if it fits in `max` chars, else `…` plus its last chars.
+fn tail_ellipsis(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - (max - 1)).collect();
+    format!("\u{2026}{tail}")
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_ellipsis_keeps_end_of_long_paths() {
+        assert_eq!(tail_ellipsis("/short", 10), "/short");
+        assert_eq!(tail_ellipsis("/home/u/tracks", 14), "/home/u/tracks");
+        assert_eq!(tail_ellipsis("/home/u/tracks", 8), "\u{2026}/tracks");
+        assert_eq!(tail_ellipsis("/home/u/tracks", 8).chars().count(), 8);
+        assert_eq!(
+            tail_ellipsis("/h/\u{00e9}t\u{00e9}s", 4),
+            "\u{2026}t\u{00e9}s"
+        );
+    }
 }

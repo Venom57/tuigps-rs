@@ -273,10 +273,11 @@ jobs:
 - **2026-10-17 — Group 3:** `app.rs` split into `src/app/` (10 modules), TOFF state moved to `TimingState`, shared device command execution.
 - **2026-10-17 — Integration:** out-of-range lat/lon rejected; hold progress count; timed-out device commands killed (`kill_on_drop`); rustdoc `-Dwarnings` in CI; README/CLAUDE.md updated; final E2E run against fake gpsd (help, hold, imperial, settings → config file, Ctrl+C).
 
+- **2026-10-17 — CSV logging completed:** `LogMode` gpx/csv/both (Settings → Logging, `log_format` in config, `--log-format`), configurable log directory (`log_dir`, `--log-dir`, `~` expansion, validated in Settings), GPX+CSV sessions share a filename stem, CSV extended with alt_hae/mode/status/sat counts/DOPs/eph/epv (append-only), REC badge shows formats.
+
 ### Remaining / not done
 - Receiver config is never read back on the Device tab (pending/applied = sent, not confirmed).
 - `u` changes units for the session only (by design; Settings saves).
-- CSV logging still not selectable from the UI.
 - D-Bus clock sync still a stub; fractional-second `timedatectl`/`date` arguments not exercised on a real system.
 - No LICENSE file (README previously claimed MIT; `publish = false` set).
 - Feature ideas not started: OSC 52 copy, MGRS/UTM, sortable satellite table, sparklines, NMEA search/save, mouse support, GLONASS freqid display.

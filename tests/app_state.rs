@@ -323,7 +323,7 @@ fn logging_start_stop_writes_valid_gpx() {
     app.handle_tagged_event((0, GpsdEvent::Connected));
 
     app.handle_event(key('l'));
-    assert!(app.logger.as_ref().is_some_and(|l| l.active));
+    assert!(app.loggers.first().is_some_and(|l| l.active));
     let files = log_files(dir.path());
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].extension().unwrap(), "gpx");
@@ -345,10 +345,10 @@ fn logging_start_stop_writes_valid_gpx() {
         &tpv_fix("2024-05-12T14:05:03Z", 51.6, -0.2),
         T0 + 3.0,
     );
-    assert_eq!(app.logger.as_ref().unwrap().point_count, 2);
+    assert_eq!(app.log_points(), Some(2));
 
     app.handle_event(key('l'));
-    assert!(app.logger.is_none());
+    assert!(!app.is_logging());
     assert_eq!(gpx_points(&files[0]), 2);
 
     // Quit path: main calls stop_logging() after the loop ends
@@ -361,7 +361,7 @@ fn logging_start_stop_writes_valid_gpx() {
     app.handle_event(ctrl_c());
     assert!(app.should_quit);
     app.stop_logging();
-    assert!(app.logger.is_none());
+    assert!(!app.is_logging());
     let mut files = log_files(dir.path());
     files.sort();
     assert_eq!(files.len(), 2, "{files:?}");
@@ -375,7 +375,7 @@ fn logging_into_missing_dir_fails_cleanly() {
     let mut app = new_app();
     app.log_dir = dir.path().join("does/not/exist");
     app.handle_event(key('l'));
-    assert!(app.logger.is_none());
+    assert!(!app.is_logging());
     assert!(!app.status_message.is_empty(), "failure is reported");
 }
 

@@ -12,9 +12,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{CoordFormat, UnitSystem};
+use crate::gps_logger::LogMode;
 
 pub const DEFAULT_HOST: &str = "localhost";
 pub const DEFAULT_PORT: u16 = 2947;
+/// Log files go to the working directory unless configured otherwise.
+pub const DEFAULT_LOG_DIR: &str = ".";
 
 const APP_DIR: &str = "tuigps-rs";
 const FILE_NAME: &str = "config.toml";
@@ -28,6 +31,10 @@ pub struct Config {
     pub port: u16,
     pub units: UnitSystem,
     pub coord_format: CoordFormat,
+    /// Which file(s) the `l` key writes: `gpx`, `csv` or `both`.
+    pub log_format: LogMode,
+    /// Directory for log files; a leading `~/` means the home directory.
+    pub log_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -37,6 +44,8 @@ impl Default for Config {
             port: DEFAULT_PORT,
             units: UnitSystem::Metric,
             coord_format: CoordFormat::DD,
+            log_format: LogMode::default(),
+            log_dir: PathBuf::from(DEFAULT_LOG_DIR),
         }
     }
 }
@@ -82,6 +91,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     if cfg.host.trim().is_empty() {
         return Err("host must not be empty".to_string());
+    }
+    if cfg.log_dir.as_os_str().is_empty() {
+        return Err("log_dir must not be empty".to_string());
     }
     Ok(cfg)
 }
@@ -164,6 +176,36 @@ pub fn startup(
     }
 }
 
+/// Apply `--log-format` / `--log-dir`, which win over the config file.
+pub fn apply_log_overrides(
+    config: &mut Config,
+    log_format: Option<LogMode>,
+    log_dir: Option<PathBuf>,
+) {
+    if let Some(m) = log_format {
+        config.log_format = m;
+    }
+    if let Some(d) = log_dir {
+        config.log_dir = d;
+    }
+}
+
+/// Expand a leading `~` / `~/` to `$HOME`; other paths are returned as-is.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    expand_tilde_with(path, std::env::var_os("HOME"))
+}
+
+/// [`expand_tilde`] with an explicit home directory (testable).
+pub fn expand_tilde_with(path: &Path, home: Option<OsString>) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path.to_path_buf();
+    };
+    match home {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 pub fn apply_cli_overrides(config: &mut Config, host: Option<String>, port: Option<u16>) {
     if let Some(h) = host {
         config.host = h;
@@ -183,7 +225,64 @@ mod tests {
             port: 3000,
             units: UnitSystem::Nautical,
             coord_format: CoordFormat::DMS,
+            log_format: LogMode::Csv,
+            log_dir: PathBuf::from("~/gps logs"),
         }
+    }
+
+    #[test]
+    fn log_settings_parse_and_default() {
+        let cfg = parse("log_format = \"both\"\nlog_dir = \"/var/log/gps\"\n").unwrap();
+        assert_eq!(cfg.log_format, LogMode::Both);
+        assert_eq!(cfg.log_dir, PathBuf::from("/var/log/gps"));
+
+        // Older files without the keys keep working
+        let cfg = parse("host = \"a\"\n").unwrap();
+        assert_eq!(cfg.log_format, LogMode::Gpx);
+        assert_eq!(cfg.log_dir, PathBuf::from("."));
+
+        assert!(parse("log_format = \"kml\"\n").is_err());
+        assert!(parse("log_dir = \"\"\n").is_err());
+    }
+
+    #[test]
+    fn log_overrides_win() {
+        let mut cfg = sample();
+        apply_log_overrides(&mut cfg, None, None);
+        assert_eq!(cfg, sample());
+        apply_log_overrides(&mut cfg, Some(LogMode::Gpx), Some(PathBuf::from("/tmp")));
+        assert_eq!(cfg.log_format, LogMode::Gpx);
+        assert_eq!(cfg.log_dir, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn tilde_expansion() {
+        let home = Some(OsString::from("/home/u"));
+        assert_eq!(
+            expand_tilde_with(Path::new("~/logs"), home.clone()),
+            PathBuf::from("/home/u/logs")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~"), home.clone()),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("/abs"), home.clone()),
+            PathBuf::from("/abs")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("./rel"), home.clone()),
+            PathBuf::from("./rel")
+        );
+        // `~user` is not supported and is left alone
+        assert_eq!(
+            expand_tilde_with(Path::new("~bob/x"), home),
+            PathBuf::from("~bob/x")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~/x"), None),
+            PathBuf::from("~/x")
+        );
     }
 
     #[test]

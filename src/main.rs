@@ -10,6 +10,7 @@ use std::io::{self, Stdout};
 use std::panic;
 use std::path::PathBuf;
 
+use tuigps_rs::gps_logger::LogMode;
 use tuigps_rs::{app, config};
 
 #[derive(Parser)]
@@ -25,13 +26,20 @@ struct Cli {
     /// ~/.config/tuigps-rs/config.toml]
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Log file format for `l`; overrides the config file [default: gpx]
+    #[arg(long, value_name = "gpx|csv|both", value_parser = clap::value_parser!(LogMode))]
+    log_format: Option<LogMode>,
+    /// Directory for log files; overrides the config file [default: .]
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.or_else(config::default_path);
-    let startup = config::startup(config_path, cli.host, cli.port);
+    let mut startup = config::startup(config_path, cli.host, cli.port);
+    config::apply_log_overrides(&mut startup.config, cli.log_format, cli.log_dir);
 
     install_panic_hook();
 

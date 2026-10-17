@@ -85,11 +85,14 @@ impl App {
             self.on_new_tpv_time();
         }
 
-        // Log if active (the logger de-duplicates by time)
-        if let Some(ref mut logger) = self.logger
-            && let Err(e) = logger.log_point(&self.gps_data)
-        {
-            let msg = format!("Log write error: {}", e);
+        // Log if active (each logger de-duplicates by time)
+        let mut write_error = None;
+        for logger in &mut self.loggers {
+            if let Err(e) = logger.log_point(&self.gps_data) {
+                write_error = Some(format!("Log write error ({}): {}", logger.filename, e));
+            }
+        }
+        if let Some(msg) = write_error {
             self.set_status(msg);
         }
 

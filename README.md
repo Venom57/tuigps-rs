@@ -12,7 +12,7 @@ A complete reimplementation of [tuigps](https://github.com/smartin/tuigps) (Pyth
 - **Device configuration** — u-blox receiver management via ubxtool (nav rate, power mode, PPS, constellations, serial speed)
 - **Clock synchronization** — arm a one-shot set of the system clock from GPS time on the next fix (timedatectl, falling back to `sudo -n date`)
 - **Position hold** — accumulate fixes with Welford's algorithm; a Hold panel shows mean position, sample count, duration, σN/σE and CEP50/CEP95 (exact bivariate-normal radius)
-- **GPS logging** — GPX 1.1 track to a timestamped file in the working directory, flushed per point and finalized even on abnormal exit; existing files are never overwritten (a CSV writer exists in code but is not reachable from the UI)
+- **GPS logging** — GPX 1.1 track, CSV (one row per fix), or both side by side, to timestamped files in a configurable directory; flushed per point, finalized even on abnormal exit, existing files are never overwritten
 - **NMEA viewer** — raw sentence stream with type filtering, pause/resume, scroll-back that stays anchored, color coding
 - **Settings** — host/port, units (metric/imperial/nautical), coordinate format (DD/DMS/DDM), saved to a config file
 - **Status at a glance** — connection badge always visible, fix age, panels marked NO DATA / STALE when data stops, `?` help overlay
@@ -61,7 +61,41 @@ host = "localhost"
 port = 2947
 units = "metric"        # metric | imperial | nautical
 coord_format = "dd"     # dd | dms | ddm
+log_format = "gpx"      # gpx | csv | both
+log_dir = "."           # existing directory; "~/" = home
 ```
+
+`--log-format <gpx|csv|both>` and `--log-dir <DIR>` override the file too.
+
+### Logging
+
+`l` starts and stops a logging session. Files are named
+`tuigps_YYYYMMDD_HHMMSS.gpx` / `.csv` (with `both`, the two files share the
+name); a `_1`, `_2`, … suffix is added rather than overwrite anything. A point
+is written once per new TPV with a 2D/3D fix. The footer shows
+`REC GPX+CSV 42 pts` while logging. Format and directory changes made during
+a session apply to the next one.
+
+CSV columns (always SI units, regardless of the display unit setting; fields
+gpsd did not report are left empty, never `NaN`):
+
+| Column | Meaning |
+|---|---|
+| `time` | gpsd TPV time, ISO 8601 UTC |
+| `latitude`, `longitude` | WGS84 decimal degrees |
+| `alt_msl` | altitude above mean sea level, m |
+| `speed` | ground speed, m/s |
+| `track` | course over ground, ° true |
+| `climb` | vertical speed, m/s |
+| `alt_hae` | altitude above the WGS84 ellipsoid, m |
+| `mode` | `2d` or `3d` |
+| `status` | `gps`, `dgps`, `rtk_fix`, `rtk_float`, `dr`, `gnss_dr`, `time_only`, `simulated`, `pps` (empty if unknown) |
+| `sats_used`, `sats_visible` | satellite counts |
+| `hdop`, `vdop`, `pdop` | dilution of precision |
+| `eph`, `epv` | estimated horizontal / vertical error, m |
+
+New columns are only ever appended, so scripts reading the leading columns
+keep working.
 
 ### Units
 
@@ -99,7 +133,7 @@ app uses, so it always matches the current tab.
 | `s` | Settings |
 | `u` | Cycle units (not saved) |
 | `m` | Open position in Google Maps (requires fix) |
-| `l` | Start/stop GPX logging (`tuigps_YYYYMMDD_HHMMSS.gpx` in the current directory) |
+| `l` | Start/stop logging (format and directory from Settings; see [Logging](#logging)) |
 | `h` | Start/stop position hold |
 
 ### Satellites Tab
@@ -155,12 +189,12 @@ The title shows FOLLOWING, SCROLLED +N or PAUSED.
 | Key | Action |
 |-----|--------|
 | `↑/↓`, `Tab/Shift+Tab` | Move between fields |
-| `Enter` | Edit host/port, cycle units/coords, or activate `[ Save ]` |
+| `Enter` | Edit host/port/log dir, cycle units/coords/log format, or activate `[ Save ]` |
 | `←/→` | Cycle value backward / forward |
 | `Ctrl+S` | Apply and save (reconnects if host/port changed) |
 | `Esc` | Cancel the current edit; press again to discard changes and close |
 
-The port accepts digits only (1–65535).
+The port accepts digits only (1–65535). The log directory must already exist.
 
 ## Tabs
 

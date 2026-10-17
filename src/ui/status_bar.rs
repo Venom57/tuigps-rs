@@ -89,12 +89,13 @@ fn right_spans(app: &App, total_width: usize) -> Vec<Span<'static>> {
     let data = &app.gps_data;
     let mut spans = vec![];
 
-    if let Some(logger) = app.logger.as_ref().filter(|l| l.active) {
+    if let Some(points) = app.log_points() {
         spans.push(Span::styled(
             " REC ",
             Style::default().fg(Color::White).bg(Color::Red).bold(),
         ));
-        spans.push(Span::raw(format!(" {} pts ", logger.point_count)));
+        let formats: Vec<&str> = app.loggers.iter().map(|l| l.format().label()).collect();
+        spans.push(Span::raw(format!(" {} {} pts ", formats.join("+"), points)));
     }
     if app.position_hold.is_some() {
         spans.push(Span::styled(

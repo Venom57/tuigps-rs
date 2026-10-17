@@ -21,9 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::clock_sync::ClockSyncRequest;
+use crate::config;
 use crate::config::{Config, Startup};
 use crate::data_model::GPSData;
-use crate::gps_logger::{GpsLogger, LogFormat};
+use crate::gps_logger::{GpsLogger, LogMode, session_stem};
 use crate::position_hold::PositionHold;
 
 mod device;
@@ -151,7 +152,13 @@ pub struct App {
     pub show_help: bool,
 
     // Subsystems
-    pub logger: Option<GpsLogger>,
+    /// Open log files for the current logging session (empty when not
+    /// logging); one per format in `log_mode`.
+    pub loggers: Vec<GpsLogger>,
+    /// Which file(s) the next logging session writes.
+    pub log_mode: LogMode,
+    /// Log output directory as configured (`~` is expanded when logging
+    /// starts).
     pub log_dir: PathBuf,
     pub position_hold: Option<PositionHold>,
 
@@ -230,8 +237,9 @@ impl App {
             should_quit: false,
             show_settings: false,
             show_help: false,
-            logger: None,
-            log_dir: PathBuf::from("."),
+            loggers: Vec::new(),
+            log_mode: LogMode::default(),
+            log_dir: PathBuf::from(config::DEFAULT_LOG_DIR),
             position_hold: None,
             host,
             port,
@@ -282,6 +290,8 @@ impl App {
         let mut app = App::new(config.host, config.port);
         app.units = config.units;
         app.coord_format = config.coord_format;
+        app.log_mode = config.log_format;
+        app.log_dir = config.log_dir;
         app.config_path = config_path;
         if let Some(msg) = message {
             app.set_status(msg);
@@ -296,6 +306,8 @@ impl App {
             port: self.port,
             units: self.units,
             coord_format: self.coord_format,
+            log_format: self.log_mode,
+            log_dir: self.log_dir.clone(),
         }
     }
 
@@ -453,31 +465,68 @@ impl App {
         }
     }
 
+    /// True while a logging session is open.
+    pub fn is_logging(&self) -> bool {
+        !self.loggers.is_empty()
+    }
+
+    /// Points written in the current session (every file gets the same
+    /// points), or `None` when not logging.
+    pub fn log_points(&self) -> Option<u32> {
+        self.loggers.first().map(|l| l.point_count)
+    }
+
     fn toggle_logging(&mut self) {
-        if self.logger.is_some() {
+        if self.is_logging() {
             self.stop_logging();
-        } else {
-            let mut logger = GpsLogger::new(LogFormat::Gpx, &self.log_dir);
-            match logger.start() {
-                Ok(()) => {
-                    self.set_status(format!("Logging to {}", logger.filename));
-                    self.logger = Some(logger);
-                }
-                Err(e) => self.set_status(format!("Failed to start logging: {}", e)),
+            return;
+        }
+        match self.start_loggers() {
+            Ok(loggers) => {
+                let names: Vec<&str> = loggers.iter().map(|l| file_name(&l.filename)).collect();
+                self.set_status(format!("Logging to {}", names.join(" + ")));
+                self.loggers = loggers;
             }
+            Err(e) => self.set_status(format!("Failed to start logging: {:#}", e)),
         }
     }
 
-    /// Stop and close the active log (if any), reporting the result.
+    /// Open one log file per format in `log_mode`, sharing a filename stem.
+    /// All or nothing: if any file fails to open, the ones already opened
+    /// are finalized (on drop) and the error is returned.
+    fn start_loggers(&self) -> anyhow::Result<Vec<GpsLogger>> {
+        let dir = config::expand_tilde(&self.log_dir);
+        let stem = session_stem();
+        let mut loggers = Vec::new();
+        for &format in self.log_mode.formats() {
+            let mut logger = GpsLogger::new(format, &dir);
+            logger.start_named(&stem)?;
+            loggers.push(logger);
+        }
+        Ok(loggers)
+    }
+
+    /// Stop and close the active log files (if any), reporting the result.
     pub fn stop_logging(&mut self) {
-        if let Some(mut logger) = self.logger.take() {
+        let Some(points) = self.log_points() else {
+            return;
+        };
+        let mut names = Vec::new();
+        let mut errors = Vec::new();
+        for mut logger in std::mem::take(&mut self.loggers) {
             match logger.stop() {
-                Ok(()) => self.set_status(format!(
-                    "Logging stopped: {} points written to {}",
-                    logger.point_count, logger.filename
-                )),
-                Err(e) => self.set_status(format!("Error closing log {}: {}", logger.filename, e)),
+                Ok(()) => names.push(file_name(&logger.filename).to_string()),
+                Err(e) => errors.push(format!("{}: {}", logger.filename, e)),
             }
+        }
+        if errors.is_empty() {
+            self.set_status(format!(
+                "Logging stopped: {} points written to {}",
+                points,
+                names.join(" + ")
+            ));
+        } else {
+            self.set_status(format!("Error closing log {}", errors.join("; ")));
         }
     }
 
@@ -495,6 +544,15 @@ impl App {
             self.set_status("Position hold started");
         }
     }
+}
+
+/// Last path component, for short status messages (the directory is shown
+/// in Settings).
+fn file_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -545,12 +603,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = new_app();
         app.log_dir = dir.path().to_path_buf();
-        assert!(app.logger.is_none());
+        assert!(!app.is_logging());
 
         app.handle_event(key_event(KeyCode::Char('l')));
         let filename = app
-            .logger
-            .as_ref()
+            .loggers
+            .first()
             .expect("logging started")
             .filename
             .clone();
@@ -558,7 +616,7 @@ mod tests {
         assert!(std::path::Path::new(&filename).exists());
 
         app.handle_event(key_event(KeyCode::Char('l')));
-        assert!(app.logger.is_none());
+        assert!(!app.is_logging());
         let contents = std::fs::read_to_string(&filename).unwrap();
         assert!(contents.trim_end().ends_with("</gpx>"));
     }
@@ -605,6 +663,8 @@ mod tests {
                 port: 4000,
                 units: UnitSystem::Nautical,
                 coord_format: CoordFormat::DDM,
+                log_format: LogMode::Both,
+                log_dir: PathBuf::from("~/tracks"),
             },
             config_path: Some(PathBuf::from("/nonexistent/config.toml")),
             message: Some("hello".into()),
@@ -615,6 +675,60 @@ mod tests {
         assert_eq!(app.coord_format, CoordFormat::DDM);
         assert_eq!(app.status_message, "hello");
         assert_eq!(app.current_config().port, 4000);
+        assert_eq!(app.log_mode, LogMode::Both);
+        assert_eq!(app.log_dir, PathBuf::from("~/tracks"));
+        // and back out again for saving
+        assert_eq!(app.current_config().log_format, LogMode::Both);
+        assert_eq!(app.current_config().log_dir, PathBuf::from("~/tracks"));
+    }
+
+    #[test]
+    fn test_logging_both_writes_gpx_and_csv_with_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_dir = dir.path().to_path_buf();
+        app.log_mode = LogMode::Both;
+
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert_eq!(app.loggers.len(), 2);
+        assert!(
+            app.status_message.contains(".gpx + "),
+            "{}",
+            app.status_message
+        );
+        let gpx = PathBuf::from(&app.loggers[0].filename);
+        let csv = PathBuf::from(&app.loggers[1].filename);
+        assert_eq!(gpx.extension().unwrap(), "gpx");
+        assert_eq!(csv.extension().unwrap(), "csv");
+        assert_eq!(gpx.file_stem(), csv.file_stem());
+
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:00Z", 1.0));
+        app.handle_gpsd_event(tpv("2024-01-15T12:30:01Z", 2.0));
+        assert_eq!(app.log_points(), Some(2));
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert!(!app.is_logging());
+        assert!(
+            app.status_message.contains("2 points"),
+            "{}",
+            app.status_message
+        );
+
+        let csv_text = std::fs::read_to_string(&csv).unwrap();
+        assert_eq!(csv_text.lines().count(), 3, "header + 2 rows:\n{csv_text}");
+        let gpx_text = std::fs::read_to_string(&gpx).unwrap();
+        assert_eq!(gpx_text.matches("<trkpt").count(), 2);
+        assert!(gpx_text.trim_end().ends_with("</gpx>"));
+    }
+
+    #[test]
+    fn test_logging_csv_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = new_app();
+        app.log_mode = LogMode::Csv;
+        app.log_dir = dir.path().to_path_buf();
+        app.handle_event(key_event(KeyCode::Char('l')));
+        assert_eq!(app.loggers.len(), 1);
+        assert!(app.loggers[0].filename.ends_with(".csv"));
     }
 
     #[test]
@@ -801,7 +915,7 @@ mod tests {
         let mut app = new_app();
         app.log_dir = PathBuf::from("/nonexistent/definitely/not/here");
         app.handle_event(key_event(KeyCode::Char('l')));
-        assert!(app.logger.is_none());
+        assert!(!app.is_logging());
         assert!(app.status_message.contains("Failed to start logging"));
     }
 
@@ -811,12 +925,12 @@ mod tests {
         let mut app = new_app();
         app.log_dir = dir.path().to_path_buf();
         app.handle_event(key_event(KeyCode::Char('l')));
-        let filename = app.logger.as_ref().unwrap().filename.clone();
+        let filename = app.loggers[0].filename.clone();
         app.handle_event(key_event(KeyCode::Char('q')));
         assert!(app.should_quit);
         // What run() does after the loop exits
         app.stop_logging();
-        assert!(app.logger.is_none());
+        assert!(!app.is_logging());
         let contents = std::fs::read_to_string(&filename).unwrap();
         assert!(contents.trim_end().ends_with("</gpx>"));
     }
