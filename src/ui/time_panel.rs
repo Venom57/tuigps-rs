@@ -3,14 +3,9 @@ use ratatui::widgets::*;
 
 use crate::app::App;
 use crate::data_model::GPSData;
-use crate::formatting::{fmt, fmt_offset, fmt_time_iso};
+use crate::formatting::{fmt, fmt_offset, fmt_time_iso, panel_title, plus_minus};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
-    let title = if show_pps { " Timing " } else { " Time " };
-    let block = Block::bordered().title(title);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let data = &app.gps_data;
     let (date, time) = fmt_time_iso(&data.time);
 
@@ -23,7 +18,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
             Span::raw("Time: "),
             Span::styled(&time, Style::default().bold()),
         ]),
-        Line::from(format!("EPT:  \u{00b1}{}", fmt(data.errors.ept, 6, " s"))),
+        Line::from(format!(
+            "EPT:  {}",
+            plus_minus(fmt(data.errors.ept, 6, " s"))
+        )),
         // The data model uses 0 for "not reported"; the real GPS-UTC leap
         // second count has been 18 since 2017 and will never be 0 again.
         Line::from(if data.leapseconds == 0 {
@@ -103,6 +101,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, show_pps: bool) {
         lines.push(Line::from(format!("TDOP: {}", fmt(data.dop.tdop, 1, ""))));
     }
 
+    let name = if show_pps { "Timing" } else { "Time" };
+    let block = Block::bordered().title(panel_title(name, lines.len(), area.height));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
     super::mark_data_state(f, area, app);
 }

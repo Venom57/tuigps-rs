@@ -3,13 +3,9 @@ use ratatui::widgets::*;
 
 use crate::app::App;
 use crate::constants::{dop_rating, mode_color, mode_name, status_color, status_name};
-use crate::formatting::fmt;
+use crate::formatting::{fmt, panel_title};
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::bordered().title(" Fix ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let data = &app.gps_data;
     let mut lines = vec![];
 
@@ -35,26 +31,35 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         data.satellites.len()
     )));
 
-    // Spacer only when there is room for it plus all four DOP rows, so
-    // PDOP/GDOP stay visible in short panels.
-    if inner.height > 7 {
-        lines.push(Line::raw(""));
-    }
-
-    for (label, value) in [
+    let dops: Vec<Line> = [
         ("HDOP", data.dop.hdop),
         ("VDOP", data.dop.vdop),
         ("PDOP", data.dop.pdop),
         ("GDOP", data.dop.gdop),
-    ] {
+    ]
+    .into_iter()
+    .map(|(label, value)| {
         let (rating, color) = dop_rating(value);
-        lines.push(Line::from(vec![
+        Line::from(vec![
             Span::raw(format!("{}: ", label)),
             Span::styled(fmt(value, 1, ""), Style::default().fg(color)),
             Span::styled(format!(" ({})", rating), Style::default().fg(color).dim()),
-        ]));
-    }
+        ])
+    })
+    .collect();
 
+    let content = lines.len() + dops.len();
+    let title = panel_title("Fix", content, area.height);
+
+    // Spacer only when there is room for it plus all DOP rows.
+    if area.height.saturating_sub(2) as usize > content {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(dops);
+
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
     super::mark_data_state(f, area, app);
 }
