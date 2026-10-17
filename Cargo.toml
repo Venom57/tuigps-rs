@@ -8,6 +8,9 @@ repository = "https://github.com/Venom57/tuigps-rs"
 readme = "README.md"
 keywords = ["gps", "gpsd", "gnss", "tui", "ratatui"]
 categories = ["command-line-utilities", "science::geo"]
+# No license has been chosen yet (no LICENSE file), so keep this off crates.io.
+# Also lets cargo-deny skip the unlicensed root crate.
+publish = false
 
 [dependencies]
 # TUI
